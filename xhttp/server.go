@@ -57,6 +57,28 @@ type httpSession struct {
 	uplinkDecided  chan struct{} // closed when uplink mode is known
 	uplinkOnce     sync.Once
 	streamUpReader io.ReadCloser // set if stream-up; nil if packet-up
+	closed         chan struct{} // closed once the session is torn down
+	closeOnce      sync.Once
+}
+
+// Close tears the session down, unblocking any reader: it closes the packet-up
+// queue, signals the closed channel (so a reader still waiting for the uplink
+// mode gives up), and closes the stream-up body if one was attached.
+func (s *httpSession) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		_ = s.queue.Close()
+		// Read streamUpReader only after uplinkDecided is observed closed: the
+		// write in decideStreamUp happens-before that close, so this is race-free.
+		select {
+		case <-s.uplinkDecided:
+			if s.streamUpReader != nil {
+				_ = s.streamUpReader.Close()
+			}
+		default:
+		}
+	})
+	return nil
 }
 
 func (s *httpSession) decideStreamUp(body io.ReadCloser) bool {
@@ -173,6 +195,7 @@ func (s *Server) upsertSession(sessionID string) *httpSession {
 		queue:         newUploadQueue(s.maxBufferedPosts),
 		connected:     make(chan struct{}),
 		uplinkDecided: make(chan struct{}),
+		closed:        make(chan struct{}),
 	}
 	s.sessions[sessionID] = sess
 	// reap if GET never arrives within 30s
@@ -184,7 +207,7 @@ func (s *Server) upsertSession(sessionID string) *httpSession {
 				delete(s.sessions, sessionID)
 			}
 			s.sessionsMu.Unlock()
-			_ = sess.queue.Close()
+			_ = sess.Close()
 		case <-sess.connected:
 		}
 	}()
@@ -383,15 +406,36 @@ func (s *Server) handleDownloadGet(w http.ResponseWriter, r *http.Request, sessi
 		},
 	}
 
-	source := sHttp.SourceAddress(r)
-	s.handler.NewConnectionEx(r.Context(), conn, source, M.Socksaddr{}, nil)
+	// NewConnectionEx may either return immediately (async handler) or block for
+	// the whole connection lifetime (e.g. VLESS mux runs its read loop inline).
+	// In the blocking case the reader only unblocks once the session is torn
+	// down, so a watcher closes the session when the request context is
+	// cancelled (client GET ends or server shuts down); otherwise that
+	// NewConnectionEx would never return and the read goroutine would leak.
+	ctx := r.Context()
+	finished := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			if sess != nil {
+				_ = sess.Close()
+			}
+		case <-finished:
+		}
+	}()
 
+	source := sHttp.SourceAddress(r)
+	s.handler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, nil)
+
+	// Wait until the connection is really done (async handlers return before
+	// the upper layer closes the conn); blocking handlers fall through at once.
 	select {
-	case <-r.Context().Done():
+	case <-ctx.Done():
 	case <-done:
 	}
+	close(finished)
 	if sess != nil {
-		_ = sess.queue.Close()
+		_ = sess.Close()
 	}
 }
 
@@ -453,19 +497,24 @@ func newLazyStreamReader(sess *httpSession) *lazyStreamReader {
 
 func (l *lazyStreamReader) Read(b []byte) (int, error) {
 	l.once.Do(func() {
-		<-l.sess.uplinkDecided
-		if l.sess.streamUpReader != nil {
-			l.src = l.sess.streamUpReader
-		} else {
-			l.src = l.sess.queue
+		select {
+		case <-l.sess.uplinkDecided:
+			if l.sess.streamUpReader != nil {
+				l.src = l.sess.streamUpReader
+			} else {
+				l.src = l.sess.queue
+			}
+		case <-l.sess.closed:
+			l.src = eofReader{}
 		}
 	})
 	return l.src.Read(b)
 }
 
 func (l *lazyStreamReader) Close() error {
-	if r, ok := l.src.(io.Closer); ok {
-		return r.Close()
-	}
-	return nil
+	return l.sess.Close()
 }
+
+type eofReader struct{}
+
+func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
