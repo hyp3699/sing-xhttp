@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
@@ -471,15 +472,53 @@ func (c *Client) openDownload(ctx context.Context, sessionID string, xc2 *xmuxCl
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	resp, err := xc2.conn.transport.RoundTrip(req)
-	if err != nil {
-		return nil, nil, nil, E.Cause(err, "xhttp: open download")
+
+	// Return as soon as the underlying connection is established (GotConn),
+	// NOT after the response headers arrive. Middleboxes like Cloudflare
+	// buffer the SSE response head until the origin emits body bytes; the
+	// origin only emits downlink bytes after it receives the uplink. If we
+	// blocked on RoundTrip here, the uplink POSTs would never start and both
+	// ends would deadlock (client "read ServerHello: EOF", server "read
+	// ClientHello: EOF"). Instead run RoundTrip in the background and hand
+	// back a WaitReadCloser whose Read blocks until the body is available.
+	gotConn := make(chan struct{})
+	var once sync.Once
+	signalConn := func() { once.Do(func() { close(gotConn) }) }
+
+	var remoteAddr, localAddr net.Addr
+	traceCtx := httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			remoteAddr = info.Conn.RemoteAddr()
+			localAddr = info.Conn.LocalAddr()
+			signalConn()
+		},
+	})
+	req = req.WithContext(traceCtx)
+
+	wrc := newWaitReadCloser()
+	go func() {
+		resp, err := xc2.conn.transport.RoundTrip(req)
+		if err != nil {
+			signalConn()
+			wrc.closeWithError(E.Cause(err, "xhttp: open download"))
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			signalConn()
+			wrc.closeWithError(E.New("xhttp: download bad status: ", resp.Status))
+			return
+		}
+		wrc.set(resp.Body)
+		signalConn()
+	}()
+
+	<-gotConn
+	if remoteAddr == nil {
+		remoteAddr = c.down.serverAddr.TCPAddr()
 	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, nil, nil, E.New("xhttp: download bad status: ", resp.Status)
-	}
-	return resp.Body, c.down.serverAddr.TCPAddr(), nil, nil
+	return wrc, remoteAddr, localAddr, nil
 }
 
 // --- stream-up ---
@@ -845,6 +884,63 @@ func (c *Client) sendOnePost(ctx context.Context, sessionID, seqStr string, payl
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return E.New("xhttp: post bad status: ", resp.Status)
+	}
+	return nil
+}
+
+// waitReadCloser is an io.ReadCloser whose reads block until the underlying
+// body is set (once the background RoundTrip produces the response) or an
+// error is recorded. It lets openDownload return at connection-establishment
+// time while the HTTP response head is still buffered by a middlebox (CF).
+type waitReadCloser struct {
+	ready  chan struct{}
+	once   sync.Once
+	body   io.ReadCloser
+	err    error
+	closed atomic.Bool
+}
+
+func newWaitReadCloser() *waitReadCloser {
+	return &waitReadCloser{ready: make(chan struct{})}
+}
+
+func (w *waitReadCloser) set(body io.ReadCloser) {
+	w.once.Do(func() {
+		w.body = body
+		close(w.ready)
+	})
+	// If Close raced ahead of set, close the just-arrived body now.
+	if w.closed.Load() && w.body != nil {
+		_ = w.body.Close()
+	}
+}
+
+func (w *waitReadCloser) closeWithError(err error) {
+	w.once.Do(func() {
+		w.err = err
+		close(w.ready)
+	})
+}
+
+func (w *waitReadCloser) Read(p []byte) (int, error) {
+	if w.body == nil {
+		<-w.ready
+		if w.err != nil {
+			return 0, w.err
+		}
+		if w.body == nil {
+			return 0, io.EOF
+		}
+	}
+	return w.body.Read(p)
+}
+
+func (w *waitReadCloser) Close() error {
+	w.closed.Store(true)
+	// Unblock any pending Read.
+	w.once.Do(func() { close(w.ready) })
+	if w.body != nil {
+		return w.body.Close()
 	}
 	return nil
 }
