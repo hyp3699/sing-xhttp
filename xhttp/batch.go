@@ -20,7 +20,7 @@ type batchAccumulator struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
 	data     []byte
-	maxBatch int  // maximum bytes returned per Drain call
+	maxBatch int // maximum bytes returned per Drain call
 	closed   bool
 	writeErr error // error returned to subsequent Write calls after CloseWithError
 }

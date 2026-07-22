@@ -6,18 +6,20 @@ Scope of this port (intentional subset of the upstream):
 
 | Mode | Status | HTTP version |
 |---|---|---|
-| `packet-up` | implemented | H1.1 (plaintext) and H2 (TLS) |
+| `packet-up` | implemented | H1.1 (plaintext, raw-socket pool) and H2 (TLS) |
 | `stream-up` | implemented | H2 (TLS) only |
-| `stream-one` | not planned (REALITY-specific) | - |
-| `stream-down` | not planned (multi-transport split) | - |
-| HTTP/3 | not planned (no CDN uses QUIC to origin today) | - |
+| `stream-one` | implemented | H2 (TLS) only (REALITY-style single bidirectional stream) |
+| `stream-down` | implemented | H1.1 / H2 / H3 (separate download path/host) |
+| `auto` | implemented | defaults to packet-up, or stream-one if REALITY |
+| HTTP/3 | implemented | QUIC transport (client + server) |
 
 Why stream-up isn't supported on plaintext H1.1: Go's `net/http` client
 buffers chunked request bodies internally, breaking the "never-FIN POST"
 requirement. Xray works around this by writing raw HTTP/1.1 to a hijacked
-socket (`splithttp/h1_conn.go` + `client.go` HTTP/1 branch). Porting that
-is ~300 lines of careful state management and brings no value over running
-stream-up over TLS, which is the realistic deployment anyway.
+socket (`splithttp/h1_conn.go` + `client.go` HTTP/1.1 branch). This port
+includes `h1_conn.go` for reliable HTTP/1.1 packet-up POSTs (raw-socket
+pool matching Xray), but stream-up over H1.1 is still not supported since
+the body is a streaming pipe that cannot be serialized to a buffer.
 
 ## Wire-level interop with stock Xray
 
@@ -38,6 +40,7 @@ stock Xray server (`xhttp` transport, default config) and vice versa.
 The library has **no sing-box dependency**. Direct imports:
 
 - `github.com/sagernet/sing` — interfaces and utilities (network, metadata, tls, logger)
+- `github.com/sagernet/quic-go` — http2 / h2c / hpack and QUIC (HTTP/3)
 - `golang.org/x/net` — http2 / h2c / hpack
 - `github.com/gofrs/uuid/v5` — session id
 
@@ -110,6 +113,45 @@ Both sides must agree on placement choices. Defaults match stock Xray
   "x_padding_header":    "X-Padding",  // for header placement
   "x_padding_key":       "x_padding",  // for query/cookie placement
   "x_padding_method":    "tokenish"    // repeat-x (default) | tokenish
+}
+```
+
+### Uplink data placement
+
+Payload can be sent in the request body (default), or encoded as base64
+chunks in headers / cookies, matching Xray's `uplinkDataPlacement`:
+
+```jsonc
+"transport": {
+  "type": "xhttp",
+  "path": "/xhttp",
+  "uplink_data_placement": "header",  // body (default) | header | cookie | auto
+  "uplink_data_key":       "payload",  // required for header/cookie/auto
+  "uplink_chunk_size":    { "from": 3000, "to": 4000 }  // optional
+}
+```
+
+### Custom session ID
+
+```jsonc
+"transport": {
+  "type": "xhttp",
+  "session_id_table":  "Base62",                // predefined name or literal charset
+  "session_id_length": { "from": 16, "to": 16 } // omit to use UUID v4
+}
+```
+
+### stream-down (separate download path)
+
+```jsonc
+"transport": {
+  "type": "xhttp",
+  "mode": "stream-down",
+  "path": "/xhttp",
+  "download_settings": {
+    "host": "download.example.com",
+    "path": "/dl"
+  }
 }
 ```
 
@@ -230,7 +272,9 @@ and accepted.
 
 ## TODO
 
-- [ ] stream-up reverse heartbeat tuning (currently a literal port)
-- [ ] HTTP/1.1 raw-socket path for stream-up (only if there's demand)
-- [ ] uplink-data placement (header / cookie carrying payload) — niche,
-      forces tiny chunk sizes; ask if you actually need it
+- [ ] REALITY integration tests — the library detects REALITY via `Config()`
+      error and auto-resolves to `stream-one`, but needs end-to-end testing
+      with sing-box's REALITY implementation
+- [ ] Fully separate download transport (different TLS/dialer for stream-down)
+      — currently only path/host can differ; the dialer/TLS is shared. A
+      `NewClientWithDownload` constructor could add this if needed

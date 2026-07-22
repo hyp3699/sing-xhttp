@@ -2,6 +2,8 @@ package xhttp
 
 import (
 	"crypto/rand"
+	"encoding/base64"
+	"fmt"
 	"math"
 	"net/http"
 	"net/url"
@@ -27,21 +29,35 @@ type codec struct {
 	xpadHeader    string
 	xpadMethod    string
 	xpadRange     Range
+
+	uplinkDataPlacement string
+	uplinkDataKey       string
+	uplinkChunkSize     Range
+	maxEachPostBytes    Range
+
+	sessionIDTable  string
+	sessionIDLength Range
 }
 
 func newCodec(o Options) *codec {
+	md := defaultsForMode(o.Mode)
 	c := &codec{
-		basePath:         normalizePath(o.Path),
-		sessionPlacement: o.SessionPlacement,
-		sessionKey:       o.SessionKey,
-		seqPlacement:     o.SeqPlacement,
-		seqKey:           o.SeqKey,
-		xpadObfs:         o.XPaddingObfsMode,
-		xpadPlacement:    o.XPaddingPlacement,
-		xpadKey:          o.XPaddingKey,
-		xpadHeader:       o.XPaddingHeader,
-		xpadMethod:       o.XPaddingMethod,
-		xpadRange:        o.XPaddingBytes.orDefault(100, 1000),
+		basePath:            normalizePath(o.Path),
+		sessionPlacement:    o.SessionPlacement,
+		sessionKey:          o.SessionKey,
+		seqPlacement:        o.SeqPlacement,
+		seqKey:              o.SeqKey,
+		xpadObfs:            o.XPaddingObfsMode,
+		xpadPlacement:       o.XPaddingPlacement,
+		xpadKey:             o.XPaddingKey,
+		xpadHeader:          o.XPaddingHeader,
+		xpadMethod:          o.XPaddingMethod,
+		xpadRange:           o.XPaddingBytes.orModeDefault(md.xPaddingBytes),
+		uplinkDataPlacement: o.UplinkDataPlacement,
+		uplinkDataKey:       o.UplinkDataKey,
+		maxEachPostBytes:    o.ScMaxEachPostBytes.orModeDefault(md.maxEachPostBytes),
+		sessionIDTable:      o.SessionIDTable,
+		sessionIDLength:     o.SessionIDLength.orDefault(0, 0),
 	}
 	if c.sessionPlacement == "" {
 		c.sessionPlacement = PlacementPath
@@ -63,6 +79,19 @@ func newCodec(o Options) *codec {
 		}
 		if c.xpadMethod == "" {
 			c.xpadMethod = PaddingMethodRepeatX
+		}
+	}
+	if c.uplinkDataPlacement == "" {
+		c.uplinkDataPlacement = PlacementBody
+	}
+	c.uplinkChunkSize = o.UplinkChunkSize.orDefault(0, 0)
+	if c.uplinkChunkSize.To == 0 {
+		c.uplinkChunkSize = defaultUplinkChunkSize(c.uplinkDataPlacement, c.maxEachPostBytes)
+	}
+	if c.uplinkChunkSize.From < 64 {
+		c.uplinkChunkSize.From = 64
+		if c.uplinkChunkSize.To < 64 {
+			c.uplinkChunkSize.To = 64
 		}
 	}
 	return c
@@ -248,24 +277,34 @@ func (c *codec) extractPaddingFromRequest(r *http.Request) string {
 		return r.URL.Query().Get("x_padding")
 	}
 
-	// Obfs mode: extract from configured placement.
-	switch c.xpadPlacement {
-	case PlacementCookie:
-		if ck, err := r.Cookie(c.xpadKey); err == nil {
+	// Obfs mode: try cookie → header → query in sequence (matches Xray).
+	if c.xpadKey != "" {
+		if ck, err := r.Cookie(c.xpadKey); err == nil && ck != nil && ck.Value != "" {
 			return ck.Value
 		}
-	case PlacementHeader:
-		return r.Header.Get(c.xpadHeader)
-	case PlacementQuery:
-		return r.URL.Query().Get(c.xpadKey)
-	case PlacementQueryInHeader:
-		headerVal := r.Header.Get(c.xpadHeader)
-		if headerVal != "" {
-			if parsed, err := url.Parse(headerVal); err == nil {
-				return parsed.Query().Get(c.xpadKey)
+	}
+
+	if c.xpadHeader != "" {
+		headerValue := r.Header.Get(c.xpadHeader)
+		if headerValue != "" {
+			if c.xpadPlacement == PlacementHeader {
+				return headerValue
+			}
+			// queryInHeader: parse the header value as a URL and extract key
+			if parsed, err := url.Parse(headerValue); err == nil {
+				if v := parsed.Query().Get(c.xpadKey); v != "" {
+					return v
+				}
 			}
 		}
 	}
+
+	if c.xpadKey != "" {
+		if v := r.URL.Query().Get(c.xpadKey); v != "" {
+			return v
+		}
+	}
+
 	return ""
 }
 
@@ -411,4 +450,146 @@ func normalizePath(p string) string {
 		p = p + "/"
 	}
 	return p
+}
+
+// --- uplink data placement (header / cookie) -------------------------------
+
+// encodeUplinkPayload writes payload into request headers or cookies as
+// base64-encoded chunks: header key "<key>-0", "<key>-1", ... or cookie
+// "<key>_0", "<key>_1", ... For body/auto placement the payload stays in the
+// request body (caller handles that). Returns true if payload was placed in
+// headers/cookies (meaning body should be empty).
+func (c *codec) encodeUplinkPayload(req *http.Request, payload []byte) bool {
+	switch c.uplinkDataPlacement {
+	case PlacementHeader:
+		c.writePayloadToHeaders(req.Header, payload)
+		return true
+	case PlacementCookie:
+		c.writePayloadToCookies(req, payload)
+		return true
+	}
+	// PlacementBody and PlacementAuto both send the payload in the request
+	// body on the client side (matching Xray's FillPacketRequest). The server
+	// under "auto" concatenates header+cookie+body, so body-only is correct and
+	// avoids duplicating the payload.
+	return false
+}
+
+func (c *codec) writePayloadToHeaders(h http.Header, payload []byte) {
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	key := c.uplinkDataKey
+	for i := 0; len(encoded) > 0; i++ {
+		chunkSize := int(rangeRand(c.uplinkChunkSize))
+		if chunkSize > len(encoded) {
+			chunkSize = len(encoded)
+		}
+		h.Set(fmt.Sprintf("%s-%d", key, i), encoded[:chunkSize])
+		encoded = encoded[chunkSize:]
+	}
+}
+
+func (c *codec) writePayloadToCookies(req *http.Request, payload []byte) {
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	key := c.uplinkDataKey
+	for i := 0; len(encoded) > 0; i++ {
+		chunkSize := int(rangeRand(c.uplinkChunkSize))
+		if chunkSize > len(encoded) {
+			chunkSize = len(encoded)
+		}
+		req.AddCookie(&http.Cookie{Name: fmt.Sprintf("%s_%d", key, i), Value: encoded[:chunkSize]})
+		encoded = encoded[chunkSize:]
+	}
+}
+
+// decodeUplinkPayload extracts payload from the request. For body placement
+// it returns nil (caller reads body). For auto it tries header + cookie + body.
+// The bodyBytes parameter is the already-read body payload (may be nil).
+func (c *codec) decodeUplinkPayload(r *http.Request, bodyPayload []byte) []byte {
+	switch c.uplinkDataPlacement {
+	case PlacementBody:
+		return bodyPayload
+	case PlacementHeader:
+		return c.readPayloadFromHeaders(r.Header)
+	case PlacementCookie:
+		return c.readPayloadFromCookies(r)
+	case PlacementAuto:
+		header := c.readPayloadFromHeaders(r.Header)
+		cookie := c.readPayloadFromCookies(r)
+		return concatBytes(header, cookie, bodyPayload)
+	}
+	return bodyPayload
+}
+
+func (c *codec) readPayloadFromHeaders(h http.Header) []byte {
+	key := c.uplinkDataKey
+	var chunks []string
+	for i := 0; ; i++ {
+		chunk := h.Get(fmt.Sprintf("%s-%d", key, i))
+		if chunk == "" {
+			break
+		}
+		chunks = append(chunks, chunk)
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.Join(chunks, ""))
+	if err != nil {
+		return nil
+	}
+	return decoded
+}
+
+func (c *codec) readPayloadFromCookies(r *http.Request) []byte {
+	key := c.uplinkDataKey
+	var chunks []string
+	for i := 0; ; i++ {
+		cookie, err := r.Cookie(fmt.Sprintf("%s_%d", key, i))
+		if err != nil || cookie == nil {
+			break
+		}
+		chunks = append(chunks, cookie.Value)
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.Join(chunks, ""))
+	if err != nil {
+		return nil
+	}
+	return decoded
+}
+
+func concatBytes(parts ...[]byte) []byte {
+	var total int
+	for _, p := range parts {
+		total += len(p)
+	}
+	out := make([]byte, 0, total)
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
+// --- custom session ID generation -------------------------------------------
+
+// generateSessionID returns a session ID. If sessionIDTable and
+// sessionIDLength are configured, generates a random string from the table.
+// Otherwise returns a UUID.
+func (c *codec) generateSessionID() string {
+	table := c.sessionIDTable
+	if predefined, ok := PredefinedTable[table]; ok {
+		table = predefined
+	}
+	length := int(c.sessionIDLength.From)
+	if c.sessionIDLength.To > c.sessionIDLength.From {
+		length = int(rangeRand(c.sessionIDLength))
+	}
+	if table != "" && length > 0 {
+		if s, ok := randStringFromCharset(length, table); ok {
+			return s
+		}
+	}
+	return newUUID()
 }

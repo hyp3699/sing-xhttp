@@ -11,11 +11,11 @@ import (
 // response body (client) or from the GET request body / uploadQueue (server);
 // Writes go into the POST request body (client) or response body (server).
 type splitConn struct {
-	reader io.Reader
-	writer io.Writer
-	local  net.Addr
-	remote net.Addr
-	once   sync.Once
+	reader  io.Reader
+	writer  io.Writer
+	local   net.Addr
+	remote  net.Addr
+	once    sync.Once
 	onClose func() error
 }
 

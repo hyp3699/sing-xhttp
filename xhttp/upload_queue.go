@@ -19,12 +19,12 @@ type packet struct {
 }
 
 type uploadQueue struct {
-	mu            sync.Mutex
-	pushed        chan packet
-	heap          uploadHeap
-	nextSeq       uint64
-	closed        bool
-	maxBuffered   int
+	mu          sync.Mutex
+	pushed      chan packet
+	heap        uploadHeap
+	nextSeq     uint64
+	closed      bool
+	maxBuffered int
 }
 
 func newUploadQueue(maxBuffered int) *uploadQueue {
@@ -102,8 +102,8 @@ func (q *uploadQueue) Read(b []byte) (int, error) {
 
 type uploadHeap []packet
 
-func (h uploadHeap) Len() int            { return len(h) }
-func (h uploadHeap) Less(i, j int) bool  { return h[i].seq < h[j].seq }
-func (h uploadHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *uploadHeap) Push(x any)         { *h = append(*h, x.(packet)) }
-func (h *uploadHeap) Pop() any           { old := *h; n := len(old); x := old[n-1]; *h = old[:n-1]; return x }
+func (h uploadHeap) Len() int           { return len(h) }
+func (h uploadHeap) Less(i, j int) bool { return h[i].seq < h[j].seq }
+func (h uploadHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *uploadHeap) Push(x any)        { *h = append(*h, x.(packet)) }
+func (h *uploadHeap) Pop() any          { old := *h; n := len(old); x := old[n-1]; *h = old[:n-1]; return x }

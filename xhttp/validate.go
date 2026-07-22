@@ -13,7 +13,7 @@ import (
 // are treated as "use default" and accepted.
 func (o Options) Validate() error {
 	switch o.Mode {
-	case "", ModePacketUp, ModeStreamUp:
+	case "", ModePacketUp, ModeStreamUp, ModeStreamOne, ModeStreamDown, ModeAuto:
 	default:
 		return E.New("xhttp: unsupported mode: ", o.Mode)
 	}
@@ -47,6 +47,25 @@ func (o Options) Validate() error {
 		default:
 			return E.New("xhttp: invalid x_padding_method: ", o.XPaddingMethod)
 		}
+	}
+
+	if !validUplinkDataPlacement(o.UplinkDataPlacement) {
+		return E.New("xhttp: invalid uplink_data_placement: ", o.UplinkDataPlacement)
+	}
+	if o.UplinkDataPlacement == PlacementHeader || o.UplinkDataPlacement == PlacementCookie || o.UplinkDataPlacement == PlacementAuto {
+		if o.UplinkDataKey == "" {
+			return E.New("xhttp: uplink_data_key is required when uplink_data_placement is header/cookie/auto")
+		}
+	}
+	if err := validRange("uplink_chunk_size", o.UplinkChunkSize); err != nil {
+		return err
+	}
+
+	if err := validRange("session_id_length", o.SessionIDLength); err != nil {
+		return err
+	}
+	if o.ServerMaxHeaderBytes < 0 {
+		return E.New("xhttp: server_max_header_bytes must be >= 0")
 	}
 
 	for _, rc := range []struct {
@@ -102,6 +121,16 @@ func validMetaPlacement(p string) bool {
 func validPaddingPlacement(p string) bool {
 	switch p {
 	case "", PlacementQuery, PlacementHeader, PlacementCookie, PlacementQueryInHeader:
+		return true
+	}
+	return false
+}
+
+// validUplinkDataPlacement reports whether p is a legal placement for uplink
+// data. Empty means "default" (body) and is accepted.
+func validUplinkDataPlacement(p string) bool {
+	switch p {
+	case "", PlacementBody, PlacementHeader, PlacementCookie, PlacementAuto:
 		return true
 	}
 	return false

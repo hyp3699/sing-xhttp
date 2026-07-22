@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -34,17 +36,20 @@ type Server struct {
 	httpServer *http.Server
 	h2Server   *http2.Server
 	h2cHandler http.Handler
+	h3Server   *http3.Server
+	quicConfig *quic.Config
 
-	host       string
-	path       string
-	method     string // "" means accept any uplink method (default POST)
-	headers    http.Header
-	opts       Options
+	host    string
+	path    string
+	method  string // "" means accept any uplink method (default POST)
+	headers http.Header
+	opts    Options
 
-	codec              *codec
-	maxEachPostBytes   Range
-	maxBufferedPosts   int
-	streamUpServerSecs Range
+	codec                *codec
+	maxEachPostBytes     Range
+	maxBufferedPosts     int
+	streamUpServerSecs   Range
+	serverMaxHeaderBytes int
 
 	sessionsMu sync.Mutex
 	sessions   map[string]*httpSession
@@ -115,33 +120,46 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options Options
 	if !strings.HasPrefix(options.Path, "/") {
 		options.Path = "/" + options.Path
 	}
+	maxHeaderBytes := int(options.ServerMaxHeaderBytes)
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = 8192
+	}
+	md := defaultsForMode(options.Mode)
 	s := &Server{
-		ctx:                ctx,
-		logger:             logger,
-		tlsConfig:          tlsConfig,
-		handler:            handler,
-		h2Server:           &http2.Server{},
-		host:               options.Host,
-		path:               options.Path,
-		method:             options.Method,
-		headers:            options.Headers.Build(),
-		opts:               options,
-		codec:              newCodec(options),
-		maxEachPostBytes:   options.ScMaxEachPostBytes.orDefault(1_000_000, 1_000_000),
-		maxBufferedPosts:   intOr(options.ScMaxBufferedPosts, 30),
-		streamUpServerSecs: options.ScStreamUpServerSecs.orDefault(20, 80),
-		sessions:           make(map[string]*httpSession),
+		ctx:                  ctx,
+		logger:               logger,
+		tlsConfig:            tlsConfig,
+		handler:              handler,
+		h2Server:             &http2.Server{},
+		host:                 options.Host,
+		path:                 options.Path,
+		method:               options.Method,
+		headers:              options.Headers.Build(),
+		opts:                 options,
+		codec:                newCodec(options),
+		maxEachPostBytes:     options.ScMaxEachPostBytes.orModeDefault(md.maxEachPostBytes),
+		maxBufferedPosts:     intOr(options.ScMaxBufferedPosts, int(md.maxBufferedPosts)),
+		streamUpServerSecs:   options.ScStreamUpServerSecs.orModeDefault(md.streamUpServerSecs),
+		serverMaxHeaderBytes: maxHeaderBytes,
+		sessions:             make(map[string]*httpSession),
 	}
 	s.httpServer = &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: tcpReadHeaderTimeout,
-		MaxHeaderBytes:    http.DefaultMaxHeaderBytes,
-		BaseContext: func(net.Listener) context.Context { return ctx },
+		MaxHeaderBytes:    maxHeaderBytes,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
 			return contextWithNewConnID(ctx)
 		},
 	}
 	s.h2cHandler = h2c.NewHandler(s, s.h2Server)
+	// HTTP/3: when TLS config requests h3 as the only NextProto, use QUIC.
+	if tlsConfig != nil && len(tlsConfig.NextProtos()) == 1 && tlsConfig.NextProtos()[0] == "h3" {
+		s.quicConfig = &quic.Config{
+			DisablePathMTUDiscovery: true, // safe default for non-Linux/Windows
+		}
+		s.h3Server = &http3.Server{Handler: s}
+	}
 	return s, nil
 }
 
@@ -162,9 +180,18 @@ func intOr(v int32, d int) int {
 	return int(v)
 }
 
-func (s *Server) Network() []string { return []string{N.NetworkTCP} }
+func (s *Server) Network() []string {
+	if s.h3Server != nil {
+		return []string{N.NetworkUDP}
+	}
+	return []string{N.NetworkTCP}
+}
 
 func (s *Server) Serve(listener net.Listener) error {
+	if s.h3Server != nil {
+		// HTTP/3: use the QUIC listener (ServePacket handles this)
+		return os.ErrInvalid
+	}
 	if s.tlsConfig != nil {
 		if len(s.tlsConfig.NextProtos()) == 0 {
 			s.tlsConfig.SetNextProtos([]string{http2.NextProtoTLS, "http/1.1"})
@@ -179,9 +206,26 @@ func (s *Server) Serve(listener net.Listener) error {
 	return s.httpServer.Serve(listener)
 }
 
-func (s *Server) ServePacket(listener net.PacketConn) error { return os.ErrInvalid }
+func (s *Server) ServePacket(listener net.PacketConn) error {
+	if s.h3Server == nil {
+		return os.ErrInvalid
+	}
+	// HTTP/3: get *tls.Config from the server config, then serve HTTP/3.
+	gotlsConfig, err := s.tlsConfig.STDConfig()
+	if err != nil {
+		return E.Cause(err, "xhttp: get TLS config for HTTP/3")
+	}
+	quicListener, err := quic.ListenEarly(listener, gotlsConfig, s.quicConfig)
+	if err != nil {
+		return E.Cause(err, "xhttp: QUIC listen")
+	}
+	return s.h3Server.ServeListener(quicListener)
+}
 
 func (s *Server) Close() error {
+	if s.h3Server != nil {
+		return common.Close(common.PtrOrNil(s.h3Server))
+	}
 	return common.Close(common.PtrOrNil(s.httpServer))
 }
 
@@ -226,7 +270,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.host != "" && !strings.EqualFold(r.Host, s.host) {
+	if s.host != "" && !isValidHTTPHost(r.Host, s.host) {
 		s.invalid(w, r, http.StatusNotFound, E.New("bad host: ", r.Host))
 		return
 	}
@@ -236,10 +280,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply common response headers / CORS.
+	s.writeCORSHeaders(w, r)
 	w.Header().Set("Cache-Control", "no-store")
-	if !s.opts.NoSSEHeader {
-		// only really useful on GET responses, but harmless to set early.
-	}
 	for k, vs := range s.headers {
 		for _, v := range vs {
 			w.Header().Set(k, v)
@@ -248,9 +290,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.codec.applyPaddingToResponseHeader(w)
 
 	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -261,10 +300,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.invalid(w, r, http.StatusBadRequest, E.New("invalid x_padding"))
 		return
 	}
+	obfsPaddingAccepted := s.codec.xpadObfs && paddingValue != ""
 
 	sessionID, seqStr, ok := s.codec.extractMetaFromRequest(r)
 	if !ok {
 		s.invalid(w, r, http.StatusNotFound, E.New("path doesn't match base"))
+		return
+	}
+
+	// stream-one: no session ID, any method with body or GET without session.
+	if sessionID == "" && s.modeAllows(ModeStreamOne) {
+		s.handleStreamOne(w, r)
 		return
 	}
 
@@ -276,19 +322,79 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case isUplink && seqStr != "":
+		if !s.modeAllows(ModePacketUp) {
+			s.invalid(w, r, http.StatusBadRequest, E.New("packet-up not allowed"))
+			return
+		}
 		s.handlePacketUpPost(w, r, sessionID, seqStr)
 	case isUplink && seqStr == "":
-		s.handleStreamUpPost(w, r, sessionID)
+		if !s.modeAllows(ModeStreamUp) {
+			s.invalid(w, r, http.StatusBadRequest, E.New("stream-up not allowed"))
+			return
+		}
+		s.handleStreamUpPost(w, r, sessionID, obfsPaddingAccepted)
 	default:
 		s.handleDownloadGet(w, r, sessionID)
 	}
 }
 
-func (s *Server) handlePacketUpPost(w http.ResponseWriter, r *http.Request, sessionID, seqStr string) {
-	if s.opts.Mode != "" && s.opts.Mode != ModePacketUp {
-		s.invalid(w, r, http.StatusBadRequest, E.New("packet-up not allowed"))
-		return
+// modeAllows reports whether the configured server mode allows the given
+// request-uplink mode. Matches Xray's server-side checks: the server only
+// distinguishes three uplink shapes — stream-one (no session), stream-up
+// (session, no seq), packet-up (session + seq). "auto"/"" accept everything.
+//
+// stream-down is a client-only concept: on the wire the server sees a
+// packet-up uplink (POST + seq) plus a download GET, so a server configured
+// as stream-down must accept packet-up uplinks (and its download GET).
+func (s *Server) modeAllows(requestMode string) bool {
+	m := s.opts.Mode
+	if m == "" || m == ModeAuto {
+		return true
 	}
+	if m == ModeStreamDown {
+		// stream-down server accepts packet-up uplinks + downloads.
+		return requestMode == ModePacketUp
+	}
+	return m == requestMode
+}
+
+// writeCORSHeaders sets CORS headers matching Xray's behavior: reflect the
+// Origin header (or "*" if absent), set Allow-Credentials when cookie
+// placement is configured, and handle OPTIONS preflight properly.
+func (s *Server) writeCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+
+	needsCredentials := s.codec.sessionPlacement == PlacementCookie ||
+		s.codec.seqPlacement == PlacementCookie ||
+		s.codec.xpadPlacement == PlacementCookie ||
+		s.codec.uplinkDataPlacement == PlacementCookie ||
+		s.codec.uplinkDataPlacement == PlacementAuto
+	if needsCredentials {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	if r.Method == http.MethodOptions {
+		requestedMethod := r.Header.Get("Access-Control-Request-Method")
+		if requestedMethod != "" {
+			w.Header().Set("Access-Control-Allow-Methods", requestedMethod)
+		} else {
+			w.Header().Set("Access-Control-Allow-Methods", "*")
+		}
+		requestedHeaders := r.Header.Get("Access-Control-Request-Headers")
+		if requestedHeaders != "" {
+			w.Header().Set("Access-Control-Allow-Headers", requestedHeaders)
+		} else {
+			w.Header().Set("Access-Control-Allow-Headers", "*")
+		}
+	}
+}
+
+func (s *Server) handlePacketUpPost(w http.ResponseWriter, r *http.Request, sessionID, seqStr string) {
 	max := int(s.maxEachPostBytes.To)
 	if max <= 0 {
 		max = 1_000_000
@@ -297,17 +403,39 @@ func (s *Server) handlePacketUpPost(w http.ResponseWriter, r *http.Request, sess
 		s.invalid(w, r, http.StatusRequestEntityTooLarge, E.New("upload too large"))
 		return
 	}
-	var body bytes.Buffer
-	lim := io.LimitReader(r.Body, int64(max)+1)
-	_, err := io.Copy(&body, lim)
-	if err != nil {
-		s.invalid(w, r, http.StatusBadRequest, E.Cause(err, "read body"))
-		return
+
+	// Read body payload (needed for body and auto placements).
+	var bodyPayload []byte
+	if s.codec.uplinkDataPlacement == PlacementBody ||
+		s.codec.uplinkDataPlacement == PlacementAuto ||
+		s.codec.uplinkDataPlacement == "" {
+		if r.ContentLength > 0 {
+			bodyPayload = make([]byte, r.ContentLength)
+			if _, err := io.ReadFull(r.Body, bodyPayload); err != nil {
+				s.invalid(w, r, http.StatusBadRequest, E.Cause(err, "read body"))
+				return
+			}
+		} else if s.codec.uplinkDataPlacement == PlacementBody || s.codec.uplinkDataPlacement == "" {
+			var buf bytes.Buffer
+			lim := io.LimitReader(r.Body, int64(max)+1)
+			if _, err := io.Copy(&buf, lim); err != nil {
+				s.invalid(w, r, http.StatusBadRequest, E.Cause(err, "read body"))
+				return
+			}
+			if buf.Len() > max {
+				s.invalid(w, r, http.StatusRequestEntityTooLarge, E.New("upload too large"))
+				return
+			}
+			bodyPayload = buf.Bytes()
+		}
 	}
-	if body.Len() > max {
+
+	payload := s.codec.decodeUplinkPayload(r, bodyPayload)
+	if len(payload) > max {
 		s.invalid(w, r, http.StatusRequestEntityTooLarge, E.New("upload too large"))
 		return
 	}
+
 	seq, err := strconv.ParseUint(seqStr, 10, 64)
 	if err != nil {
 		s.invalid(w, r, http.StatusBadRequest, E.Cause(err, "bad seq"))
@@ -315,18 +443,17 @@ func (s *Server) handlePacketUpPost(w http.ResponseWriter, r *http.Request, sess
 	}
 	sess := s.upsertSession(sessionID)
 	sess.decidePacketUp()
-	if err := sess.queue.Push(packet{payload: body.Bytes(), seq: seq}); err != nil {
+	if err := sess.queue.Push(packet{payload: payload, seq: seq}); err != nil {
 		s.invalid(w, r, http.StatusConflict, err)
 		return
+	}
+	if len(bodyPayload) == 0 {
+		w.Header().Set("Cache-Control", "no-store")
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Server) handleStreamUpPost(w http.ResponseWriter, r *http.Request, sessionID string) {
-	if s.opts.Mode != "" && s.opts.Mode != ModeStreamUp {
-		s.invalid(w, r, http.StatusBadRequest, E.New("stream-up not allowed"))
-		return
-	}
+func (s *Server) handleStreamUpPost(w http.ResponseWriter, r *http.Request, sessionID string, obfsPaddingAccepted bool) {
 	sess := s.upsertSession(sessionID)
 	if !sess.decideStreamUp(r.Body) {
 		s.invalid(w, r, http.StatusConflict, E.New("uplink already attached"))
@@ -339,32 +466,80 @@ func (s *Server) handleStreamUpPost(w http.ResponseWriter, r *http.Request, sess
 	}
 
 	// Optional reverse heartbeat to keep CDN from killing the long POST.
-	done := make(chan struct{})
-	go func() {
-		if r.Header.Get("Referer") == "" || s.streamUpServerSecs.To == 0 {
-			return
-		}
-		tk := time.NewTimer(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
-		defer tk.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-tk.C:
-				if _, err := w.Write(bytes.Repeat([]byte{'X'}, int(rangeRand(s.codec.xpadRange)))); err != nil {
+	// Matches Xray: heartbeat fires when Referer is present (legacy compat
+	// marker) or when obfs padding was accepted.
+	hasLegacyReferer := r.Header.Get("Referer") != ""
+	if (hasLegacyReferer || obfsPaddingAccepted) && s.streamUpServerSecs.To > 0 {
+		done := make(chan struct{})
+		go func() {
+			tk := time.NewTimer(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
+			defer tk.Stop()
+			for {
+				select {
+				case <-done:
 					return
+				case <-tk.C:
+					if _, err := w.Write(bytes.Repeat([]byte{'X'}, int(rangeRand(s.codec.xpadRange)))); err != nil {
+						return
+					}
+					if fl, ok := w.(http.Flusher); ok {
+						fl.Flush()
+					}
+					tk.Reset(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
 				}
-				if fl, ok := w.(http.Flusher); ok {
-					fl.Flush()
-				}
-				tk.Reset(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
 			}
-		}
-	}()
+		}()
+		<-r.Context().Done()
+		close(done)
+		return
+	}
 
 	// Wait until the session's GET ends (or POST itself errors).
 	<-r.Context().Done()
-	close(done)
+}
+
+// handleStreamOne handles the stream-one mode: a single bidirectional HTTP
+// stream with no session ID (REALITY-style). The request body is the uplink
+// and the response body is the downlink.
+func (s *Server) handleStreamOne(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-store")
+	if !s.opts.NoSSEHeader {
+		w.Header().Set("Content-Type", "text/event-stream")
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	writer := &flushWriter{w: w, flusher: flusher}
+	conn := &splitConn{
+		reader:  r.Body,
+		writer:  writer,
+		local:   nil,
+		remote:  parseRemote(r),
+		onClose: func() error { return nil },
+	}
+
+	ctx := r.Context()
+	finished := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = r.Body.Close()
+		case <-finished:
+		}
+	}()
+
+	source := sHttp.SourceAddress(r)
+	s.handler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, nil)
+
+	select {
+	case <-ctx.Done():
+	case <-finished:
+	}
+	close(finished)
 }
 
 func (s *Server) handleDownloadGet(w http.ResponseWriter, r *http.Request, sessionID string) {
@@ -449,10 +624,35 @@ func (s *Server) invalid(w http.ResponseWriter, r *http.Request, code int, err e
 }
 
 func parseRemote(r *http.Request) net.Addr {
+	// Prefer the real client IP from X-Forwarded-For (set by CDNs / reverse
+	// proxies). The first entry is the originating client.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		first := xff
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			first = xff[:i]
+		}
+		first = strings.TrimSpace(first)
+		if ip := net.ParseIP(first); ip != nil {
+			return &net.TCPAddr{IP: ip, Port: 0}
+		}
+	}
 	if a, err := net.ResolveTCPAddr("tcp", r.RemoteAddr); err == nil {
 		return a
 	}
 	return &net.TCPAddr{}
+}
+
+// isValidHTTPHost compares a request Host against the configured host,
+// stripping any :port suffix from the request (matches Xray/sing-box).
+func isValidHTTPHost(requestHost, configHost string) bool {
+	r := strings.ToLower(requestHost)
+	c := strings.ToLower(configHost)
+	if strings.Contains(r, ":") {
+		if h, _, err := net.SplitHostPort(r); err == nil {
+			return h == c
+		}
+	}
+	return r == c
 }
 
 // flushWriter flushes after every write so downlink bytes hit the wire ASAP.

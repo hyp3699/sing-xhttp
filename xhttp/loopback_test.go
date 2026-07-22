@@ -13,17 +13,21 @@ import (
 	"github.com/justinwoo280/sing-xhttp/xhttp"
 
 	"github.com/sagernet/sing/common/logger"
-	aTLS "github.com/sagernet/sing/common/tls"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	aTLS "github.com/sagernet/sing/common/tls"
 )
 
 func anyServerTLS(s *serverTLS) aTLS.ServerConfig {
-	if s == nil { return nil }
+	if s == nil {
+		return nil
+	}
 	return s
 }
 func anyClientTLS(c *clientTLS) aTLS.Config {
-	if c == nil { return nil }
+	if c == nil {
+		return nil
+	}
 	return c
 }
 
@@ -58,7 +62,9 @@ func runEchoWithOpts(t *testing.T, mode string, useTLS bool, customize func(*xht
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 
@@ -66,8 +72,8 @@ func runEchoWithOpts(t *testing.T, mode string, useTLS bool, customize func(*xht
 	ctx := context.Background()
 
 	opts := xhttp.Options{
-		Mode: mode,
-		Path: "/xhttp",
+		Mode:               mode,
+		Path:               "/xhttp",
 		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096}, // small to exercise splitting
 	}
 	if customize != nil {
@@ -88,18 +94,24 @@ func runEchoWithOpts(t *testing.T, mode string, useTLS bool, customize func(*xht
 	var cCfg = anyClientTLS(cTLS)
 
 	server, err := xhttp.NewServer(ctx, logger, opts, sCfg, echoHandler{})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer server.Close()
 	go server.Serve(listener)
 
 	time.Sleep(50 * time.Millisecond)
 
 	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), opts, cCfg)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer client.Close()
 
 	conn, err := client.DialContext(ctx)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer conn.Close()
 
 	payload := make([]byte, 64*1024)
@@ -215,8 +227,8 @@ func TestXmuxParallelSessions(t *testing.T) {
 	sTLS, cTLS := makeTLSPair(t)
 
 	opts := xhttp.Options{
-		Mode: xhttp.ModePacketUp,
-		Path: "/xhttp",
+		Mode:               xhttp.ModePacketUp,
+		Path:               "/xhttp",
 		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
 		Xmux: &xhttp.XmuxConfig{
 			MaxConnections:   &xhttp.Range{From: 4, To: 4},
@@ -415,8 +427,8 @@ func TestPacketUpManySmallWrites(t *testing.T) {
 	sTLS, cTLS := makeTLSPair(t)
 
 	opts := xhttp.Options{
-		Mode: xhttp.ModePacketUp,
-		Path: "/xhttp",
+		Mode:               xhttp.ModePacketUp,
+		Path:               "/xhttp",
 		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
 	}
 
@@ -498,8 +510,8 @@ func TestPacketUpLargePayload(t *testing.T) {
 	sTLS, cTLS := makeTLSPair(t)
 
 	opts := xhttp.Options{
-		Mode: xhttp.ModePacketUp,
-		Path: "/xhttp",
+		Mode:               xhttp.ModePacketUp,
+		Path:               "/xhttp",
 		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
 	}
 
@@ -572,8 +584,8 @@ func TestPathQueryPassthrough(t *testing.T) {
 	sTLS, cTLS := makeTLSPair(t)
 
 	opts := xhttp.Options{
-		Mode: xhttp.ModePacketUp,
-		Path: "/xhttp?cover=true&style=fancy",
+		Mode:               xhttp.ModePacketUp,
+		Path:               "/xhttp?cover=true&style=fancy",
 		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
 	}
 
@@ -646,8 +658,8 @@ func TestXmuxMidUploadRotation(t *testing.T) {
 	sTLS, cTLS := makeTLSPair(t)
 
 	opts := xhttp.Options{
-		Mode: xhttp.ModePacketUp,
-		Path: "/xhttp",
+		Mode:               xhttp.ModePacketUp,
+		Path:               "/xhttp",
 		ScMaxEachPostBytes: &xhttp.Range{From: 1024, To: 1024},
 		Xmux: &xhttp.XmuxConfig{
 			HMaxRequestTimes: &xhttp.Range{From: 5, To: 5},

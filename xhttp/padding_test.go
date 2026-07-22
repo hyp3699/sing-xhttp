@@ -53,10 +53,10 @@ func TestExtractPaddingDefaultNoPadding(t *testing.T) {
 
 func TestExtractPaddingObfsHeader(t *testing.T) {
 	c := newCodec(Options{
-		Path:             "/xhttp",
-		XPaddingObfsMode: true,
+		Path:              "/xhttp",
+		XPaddingObfsMode:  true,
 		XPaddingPlacement: PlacementHeader,
-		XPaddingHeader:   "X-Pad",
+		XPaddingHeader:    "X-Pad",
 	})
 
 	pad := strings.Repeat("Z", 300)
@@ -71,10 +71,10 @@ func TestExtractPaddingObfsHeader(t *testing.T) {
 
 func TestExtractPaddingObfsCookie(t *testing.T) {
 	c := newCodec(Options{
-		Path:             "/xhttp",
-		XPaddingObfsMode: true,
+		Path:              "/xhttp",
+		XPaddingObfsMode:  true,
 		XPaddingPlacement: PlacementCookie,
-		XPaddingKey:      "pad",
+		XPaddingKey:       "pad",
 	})
 
 	pad := strings.Repeat("A", 500)
@@ -89,10 +89,10 @@ func TestExtractPaddingObfsCookie(t *testing.T) {
 
 func TestExtractPaddingObfsQuery(t *testing.T) {
 	c := newCodec(Options{
-		Path:             "/xhttp",
-		XPaddingObfsMode: true,
+		Path:              "/xhttp",
+		XPaddingObfsMode:  true,
 		XPaddingPlacement: PlacementQuery,
-		XPaddingKey:      "qpad",
+		XPaddingKey:       "qpad",
 	})
 
 	pad := strings.Repeat("B", 400)
@@ -106,11 +106,11 @@ func TestExtractPaddingObfsQuery(t *testing.T) {
 
 func TestExtractPaddingObfsQueryInHeader(t *testing.T) {
 	c := newCodec(Options{
-		Path:             "/xhttp",
-		XPaddingObfsMode: true,
+		Path:              "/xhttp",
+		XPaddingObfsMode:  true,
 		XPaddingPlacement: PlacementQueryInHeader,
-		XPaddingKey:      "x_padding",
-		XPaddingHeader:   "Referer",
+		XPaddingKey:       "x_padding",
+		XPaddingHeader:    "Referer",
 	})
 
 	pad := strings.Repeat("C", 250)
@@ -128,7 +128,7 @@ func TestExtractPaddingObfsQueryInHeader(t *testing.T) {
 
 func TestValidatePaddingRepeatXValid(t *testing.T) {
 	c := newCodec(Options{
-		Path:         "/xhttp",
+		Path:          "/xhttp",
 		XPaddingBytes: &Range{From: 100, To: 500},
 	})
 
@@ -148,7 +148,7 @@ func TestValidatePaddingRepeatXValid(t *testing.T) {
 
 func TestValidatePaddingRepeatXTooShort(t *testing.T) {
 	c := newCodec(Options{
-		Path:         "/xhttp",
+		Path:          "/xhttp",
 		XPaddingBytes: &Range{From: 100, To: 500},
 	})
 
@@ -162,7 +162,7 @@ func TestValidatePaddingRepeatXTooShort(t *testing.T) {
 
 func TestValidatePaddingRepeatXTooLong(t *testing.T) {
 	c := newCodec(Options{
-		Path:         "/xhttp",
+		Path:          "/xhttp",
 		XPaddingBytes: &Range{From: 100, To: 500},
 	})
 
@@ -176,7 +176,7 @@ func TestValidatePaddingRepeatXTooLong(t *testing.T) {
 
 func TestValidatePaddingEmpty(t *testing.T) {
 	c := newCodec(Options{
-		Path:         "/xhttp",
+		Path:          "/xhttp",
 		XPaddingBytes: &Range{From: 100, To: 500},
 	})
 
@@ -258,7 +258,7 @@ func TestValidatePaddingDefaultRange(t *testing.T) {
 func TestPaddingRoundTripDefault(t *testing.T) {
 	// Simulate what the client produces and verify the server would accept it.
 	c := newCodec(Options{
-		Path:         "/xhttp",
+		Path:          "/xhttp",
 		XPaddingBytes: &Range{From: 100, To: 500},
 	})
 
@@ -278,12 +278,12 @@ func TestPaddingRoundTripDefault(t *testing.T) {
 
 func TestPaddingRoundTripObfsHeader(t *testing.T) {
 	c := newCodec(Options{
-		Path:             "/xhttp",
-		XPaddingObfsMode: true,
+		Path:              "/xhttp",
+		XPaddingObfsMode:  true,
 		XPaddingPlacement: PlacementHeader,
-		XPaddingHeader:   "X-Pad",
-		XPaddingMethod:   PaddingMethodRepeatX,
-		XPaddingBytes:    &Range{From: 200, To: 800},
+		XPaddingHeader:    "X-Pad",
+		XPaddingMethod:    PaddingMethodRepeatX,
+		XPaddingBytes:     &Range{From: 200, To: 800},
 	})
 
 	req, _ := http.NewRequest("POST", "https://example.com/xhttp/sid/0", nil)
@@ -300,12 +300,12 @@ func TestPaddingRoundTripObfsHeader(t *testing.T) {
 
 func TestPaddingRoundTripObfsCookieTokenish(t *testing.T) {
 	c := newCodec(Options{
-		Path:             "/xhttp",
-		XPaddingObfsMode: true,
+		Path:              "/xhttp",
+		XPaddingObfsMode:  true,
 		XPaddingPlacement: PlacementCookie,
-		XPaddingKey:      "cspad",
-		XPaddingMethod:   PaddingMethodTokenish,
-		XPaddingBytes:    &Range{From: 100, To: 600},
+		XPaddingKey:       "cspad",
+		XPaddingMethod:    PaddingMethodTokenish,
+		XPaddingBytes:     &Range{From: 100, To: 600},
 	})
 
 	req, _ := http.NewRequest("POST", "https://example.com/xhttp/sid/0", nil)

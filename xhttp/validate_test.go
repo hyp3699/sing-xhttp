@@ -40,6 +40,28 @@ func TestValidateAcceptsValid(t *testing.T) {
 			MaxConcurrency: &Range{From: 16, To: 16},
 			MaxConnections: &Range{From: 4, To: 4},
 		}}},
+		{"uplink header placement", Options{
+			UplinkDataPlacement: PlacementHeader,
+			UplinkDataKey:       "payload",
+		}},
+		{"uplink cookie placement", Options{
+			UplinkDataPlacement: PlacementCookie,
+			UplinkDataKey:       "payload",
+		}},
+		{"uplink auto placement", Options{
+			UplinkDataPlacement: PlacementAuto,
+			UplinkDataKey:       "payload",
+		}},
+		{"uplink body placement (no key needed)", Options{
+			UplinkDataPlacement: PlacementBody,
+		}},
+		{"custom session ID", Options{
+			SessionIDTable:  "Base62",
+			SessionIDLength: &Range{From: 16, To: 16},
+		}},
+		{"stream-one mode", Options{Mode: ModeStreamOne}},
+		{"auto mode", Options{Mode: ModeAuto}},
+		{"server max header bytes", Options{ServerMaxHeaderBytes: 16384}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,7 +77,7 @@ func TestValidateRejectsInvalid(t *testing.T) {
 		name string
 		o    Options
 	}{
-		{"bad mode", Options{Mode: "stream-one"}},
+		{"bad mode", Options{Mode: "stream-two"}},
 		{"bad session placement", Options{SessionPlacement: "body"}},
 		{"bad seq placement", Options{SeqPlacement: "nonsense"}},
 		{"session/seq collide on header default keys", Options{
@@ -79,6 +101,11 @@ func TestValidateRejectsInvalid(t *testing.T) {
 		{"bad xmux range", Options{Xmux: &XmuxConfig{
 			MaxConnections: &Range{From: 10, To: 2},
 		}}},
+		{"uplink header without key", Options{UplinkDataPlacement: PlacementHeader}},
+		{"uplink cookie without key", Options{UplinkDataPlacement: PlacementCookie}},
+		{"uplink auto without key", Options{UplinkDataPlacement: PlacementAuto}},
+		{"uplink bad placement", Options{UplinkDataPlacement: "path"}},
+		{"negative server max header bytes", Options{ServerMaxHeaderBytes: -1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
