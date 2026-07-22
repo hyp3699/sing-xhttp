@@ -36,10 +36,8 @@ types — everything the server actually parses):
 This means a sing-box client built with `sing-xhttp` should talk to a
 stock Xray server (`xhttp` transport, default config) and vice versa.
 
-Note: the local *tuning* defaults (POST sizing / pacing) are differentiated
-per mode and no longer identical to Xray's fixed 1MB/30ms — see
-[Per-mode defaults](#per-mode-defaults). These are local behavior only and
-don't affect the wire format or interop.
+Local tuning defaults (POST sizing / pacing) also match Xray's — see
+[Defaults](#defaults).
 
 ## Dependencies
 
@@ -93,7 +91,7 @@ Client/server outbound + inbound JSON snippet:
   "mode": "packet-up",       // or "stream-up" / "stream-one" / "stream-down" / "auto"
   "path": "/xhttp",
   "host": "example.com",
-  // optional — omit to use the per-mode default ({256KB,1MB} for packet-up):
+  // optional — omit to use the default ({1MB,1MB}):
   "sc_max_each_post_bytes": { "from": 1000000, "to": 1000000 },
   "x_padding_bytes":        { "from": 100,     "to": 1000 }
 }
@@ -194,29 +192,27 @@ The XMUX field names mirror Xray's so the same config block works on both
 sides. Setting `max_connections > 0` with `max_concurrency=0` simply spreads
 sessions over up to N conns without per-conn caps.
 
-## Per-mode defaults
+## Defaults
 
-When a tuning field is left unset, the default depends on the transport
-mode (see `defaultsForMode`). Only the parameters that actually take effect
-in a given mode differ; the rest carry sensible placeholder values. An
-explicit user value always overrides the mode default (a range with `To == 0`
-is treated as "unset").
+When a tuning field is left unset, these Xray-aligned defaults apply (see
+`defaultsForMode`). They are uniform across modes for predictable behavior and
+maximum interop. An explicit user value always overrides the default (a range
+with `To == 0` is treated as "unset").
 
-| Parameter | `packet-up` / `stream-down` / `auto` | `stream-up` / `stream-one` |
+| Parameter | Default | Notes |
 |---|---|---|
-| `sc_max_each_post_bytes`   | `{256KB, 1MB}` (random) | `{1MB, 1MB}` (unused) |
-| `sc_min_posts_interval_ms` | `{10, 30}` ms (random)  | `{30, 30}` (unused) |
-| `sc_max_buffered_posts`    | `30` | `30` |
-| `sc_stream_up_server_secs` | `{20, 80}` s (unused)   | `{20, 80}` s (heartbeat) |
-| `x_padding_bytes`          | `{100, 1000}` | `{100, 1000}` |
+| `sc_max_each_post_bytes`   | `{1MB, 1MB}` | fixed 1 MB uplink POST chunk (packet-up / stream-down) |
+| `sc_min_posts_interval_ms` | `{30, 30}` ms | anti-burst pacing between POSTs |
+| `sc_max_buffered_posts`    | `30` | server-side reorder buffer |
+| `sc_stream_up_server_secs` | `{20, 80}` s | stream-up / stream-one heartbeat window |
+| `x_padding_bytes`          | `{100, 1000}` | padding size |
 
-Rationale (balanced profile): `packet-up`/`stream-down` carry the uplink as a
-stream of POSTs, so a `{256KB,1MB}` random post size mixes throughput with
-traffic-shape variety and a `{10,30}`ms random interval cuts latency while
-keeping anti-burst jitter. `stream-up`/`stream-one` carry the uplink as a
-single long-lived POST, so the post-size/interval knobs don't apply; what
-matters is the `{20,80}`s server heartbeat that keeps CDNs from killing the
-long POST.
+A differentiated per-mode profile (smaller randomized post size for packet-up)
+was tried and reverted: over response-buffering CDNs like Cloudflare, a fixed
+1 MB post minimizes per-POST round trips and is the single biggest throughput
+lever, so matching Xray's defaults is both faster and simpler. The
+`defaultsForMode` function keeps its per-mode shape so a future profile can
+differentiate again without touching call sites.
 
 These are all **local behavior** parameters (POST sizing / pacing / heartbeat /
 reorder buffer). They never change the wire format — the server never inspects
@@ -226,7 +222,7 @@ POST timing — so interop with stock Xray is unaffected.
 
 - `sc_max_each_post_bytes` caps the size of each uplink POST in `packet-up` /
   `stream-down` mode. Smaller values mean more POSTs per MB. Default is a
-  random `{256KB, 1MB}` (see per-mode defaults above).
+  fixed `{1MB, 1MB}` (see [Defaults](#defaults)).
 - `sc_max_buffered_posts` (default 30) limits how many out-of-order POSTs
   the server holds before EOF-ing the session. It guards against a client
   sending seq numbers far ahead of what the server can reassemble. Raising
@@ -243,9 +239,10 @@ POST timing — so interop with stock Xray is unaffected.
 will never match `stream-up` throughput — don't expect it to. The knobs
 below trade obfuscation for speed; pick based on what you need.
 
-- **Throughput-first:** raise `sc_max_each_post_bytes` to a fixed `{1MB, 1MB}`
-  and leave `sc_min_posts_interval_ms` at its default. Fewer, larger POSTs is
-  the single biggest lever (~32 MB/s in the loopback benchmark).
+- **Throughput-first (default):** keep `sc_max_each_post_bytes` at the fixed
+  `{1MB, 1MB}` default and leave `sc_min_posts_interval_ms` at `{30,30}`. Fewer,
+  larger POSTs is the single biggest lever (~32 MB/s in the loopback benchmark)
+  and minimizes per-POST round trips through CDNs.
 - **Obfuscation-first (small chunks):** if you set a small
   `sc_max_each_post_bytes` (e.g. 16 KB) to blend in, the per-POST pacing
   interval dominates and throughput drops sharply. To recover some of it,
@@ -255,11 +252,11 @@ below trade obfuscation for speed; pick based on what you need.
   chunks go from ~0.5 MB/s (single connection) to ~1.8 MB/s with
   `max_connections: 4` — a 3–4x gain, not free 4x, because a single
   session only spreads over connections the pool has already opened.
-- **`sc_min_posts_interval_ms`** defaults to a random `{10, 30}` ms in
-  packet-up/stream-down. Lowering it raises throughput at the cost of a more
-  bursty, more fingerprintable POST cadence. Setting `{0, 0}` is treated as
-  "unset" and restores the mode default — use a small non-zero value like
-  `{1, 1}` if you genuinely want to disable pacing.
+- **`sc_min_posts_interval_ms`** defaults to `{30, 30}` (30 ms). Lowering it
+  raises throughput at the cost of a more bursty, more fingerprintable POST
+  cadence. Setting `{0, 0}` is treated as "unset" and restores the 30 ms
+  default — use a small non-zero value like `{1, 1}` if you genuinely want to
+  disable pacing.
 
   Note: the per-connection pacing here intentionally differs from stock
   Xray, which serializes the interval globally. It does not change the wire
@@ -276,7 +273,7 @@ GOARCH=amd64 go test ./xhttp/ -run='^$' -bench='Throughput|Dial' -benchtime=50x
 ```
 
 Benchmarks pin `sc_max_each_post_bytes` explicitly (fixed 1 MB or 16 KB) to
-isolate the post-size variable, rather than relying on the per-mode default.
+isolate the post-size variable, rather than relying on the default.
 
 | Benchmark | Throughput | Notes |
 |---|---|---|

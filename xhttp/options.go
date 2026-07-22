@@ -151,18 +151,20 @@ func (r *Range) orModeDefault(d Range) Range {
 	return *r
 }
 
-// modeDefaults holds the per-mode default values for the tuning parameters
-// whose optimal value depends on the transport mode. Only the parameters that
-// actually take effect in a given mode matter; the rest are set to sensible
-// values for consistency.
+// modeDefaults holds the default tuning values. These match stock Xray
+// splithttp defaults for maximum interop and predictable behavior:
+//   - sc_max_each_post_bytes {1MB,1MB}: fixed 1 MB uplink POST chunk. Fewer,
+//     larger POSTs is the single biggest throughput lever and minimizes
+//     per-POST round trips through CDNs — a differentiated smaller value was
+//     tried and reverted as a net negative over Cloudflare.
+//   - sc_min_posts_interval_ms {30,30}: 30 ms anti-burst pacing.
+//   - sc_max_buffered_posts 30: server-side reorder buffer.
+//   - sc_stream_up_server_secs {20,80}: stream-up heartbeat window.
+//   - x_padding_bytes {100,1000}: padding size.
 //
-// Balanced profile:
-//   - packet-up / stream-down (POST-carried uplink): post size {256KB,1MB} to
-//     mix throughput with traffic-shape variety; post interval {10,30}ms to cut
-//     latency while keeping anti-burst jitter; reorder buffer 30.
-//   - stream-up / stream-one (single long-lived stream): the sc* POST knobs are
-//     irrelevant; the server heartbeat window {20,80}s keeps CDNs from killing
-//     the long POST.
+// The struct/function are kept per-mode-shaped so a future profile can
+// differentiate again without touching call sites; today every mode returns
+// the same Xray-aligned values.
 type modeDefaults struct {
 	maxEachPostBytes   Range
 	minPostsIntervalMs Range
@@ -172,24 +174,12 @@ type modeDefaults struct {
 }
 
 func defaultsForMode(mode string) modeDefaults {
-	switch mode {
-	case ModeStreamUp, ModeStreamOne:
-		return modeDefaults{
-			// POST knobs unused by stream modes; keep a large single-post value.
-			maxEachPostBytes:   Range{From: 1_000_000, To: 1_000_000},
-			minPostsIntervalMs: Range{From: 30, To: 30},
-			maxBufferedPosts:   30,
-			streamUpServerSecs: Range{From: 20, To: 80},
-			xPaddingBytes:      Range{From: 100, To: 1000},
-		}
-	default: // packet-up, stream-down, auto, ""
-		return modeDefaults{
-			maxEachPostBytes:   Range{From: 256 * 1024, To: 1_000_000},
-			minPostsIntervalMs: Range{From: 10, To: 30},
-			maxBufferedPosts:   30,
-			streamUpServerSecs: Range{From: 20, To: 80},
-			xPaddingBytes:      Range{From: 100, To: 1000},
-		}
+	return modeDefaults{
+		maxEachPostBytes:   Range{From: 1_000_000, To: 1_000_000},
+		minPostsIntervalMs: Range{From: 30, To: 30},
+		maxBufferedPosts:   30,
+		streamUpServerSecs: Range{From: 20, To: 80},
+		xPaddingBytes:      Range{From: 100, To: 1000},
 	}
 }
 

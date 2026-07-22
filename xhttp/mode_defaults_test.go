@@ -2,37 +2,28 @@ package xhttp
 
 import "testing"
 
-// Verify per-mode default differentiation: packet-up / stream-down get a
-// {256KB,1MB} post size and {10,30}ms interval; stream-up / stream-one get the
-// large single-post value and no interval tuning relevance.
+// Defaults are Xray-aligned and uniform across modes: {1MB,1MB} post size,
+// {30,30}ms interval, {20,80}s stream heartbeat, {100,1000} padding. The
+// per-mode function shape is retained for a possible future profile.
 func TestModeDefaults(t *testing.T) {
-	cases := []struct {
-		mode            string
-		wantPostFrom    int32
-		wantPostTo      int32
-		wantIntervalMin int32
-	}{
-		{ModePacketUp, 256 * 1024, 1_000_000, 10},
-		{ModeStreamDown, 256 * 1024, 1_000_000, 10},
-		{ModeAuto, 256 * 1024, 1_000_000, 10},
-		{"", 256 * 1024, 1_000_000, 10},
-		{ModeStreamUp, 1_000_000, 1_000_000, 30},
-		{ModeStreamOne, 1_000_000, 1_000_000, 30},
-	}
-	for _, tc := range cases {
-		t.Run(tc.mode, func(t *testing.T) {
-			md := defaultsForMode(tc.mode)
-			if md.maxEachPostBytes.From != tc.wantPostFrom || md.maxEachPostBytes.To != tc.wantPostTo {
-				t.Errorf("post size: got {%d,%d}, want {%d,%d}",
-					md.maxEachPostBytes.From, md.maxEachPostBytes.To, tc.wantPostFrom, tc.wantPostTo)
+	modes := []string{ModePacketUp, ModeStreamDown, ModeAuto, "", ModeStreamUp, ModeStreamOne}
+	for _, mode := range modes {
+		t.Run(mode, func(t *testing.T) {
+			md := defaultsForMode(mode)
+			if md.maxEachPostBytes != (Range{From: 1_000_000, To: 1_000_000}) {
+				t.Errorf("post size: got %+v, want {1000000,1000000}", md.maxEachPostBytes)
 			}
-			if md.minPostsIntervalMs.From != tc.wantIntervalMin {
-				t.Errorf("interval min: got %d, want %d", md.minPostsIntervalMs.From, tc.wantIntervalMin)
+			if md.minPostsIntervalMs != (Range{From: 30, To: 30}) {
+				t.Errorf("interval: got %+v, want {30,30}", md.minPostsIntervalMs)
 			}
-			// stream heartbeat window is uniform across modes.
-			if md.streamUpServerSecs.From != 20 || md.streamUpServerSecs.To != 80 {
-				t.Errorf("stream-up secs: got {%d,%d}, want {20,80}",
-					md.streamUpServerSecs.From, md.streamUpServerSecs.To)
+			if md.maxBufferedPosts != 30 {
+				t.Errorf("buffered posts: got %d, want 30", md.maxBufferedPosts)
+			}
+			if md.streamUpServerSecs != (Range{From: 20, To: 80}) {
+				t.Errorf("stream secs: got %+v, want {20,80}", md.streamUpServerSecs)
+			}
+			if md.xPaddingBytes != (Range{From: 100, To: 1000}) {
+				t.Errorf("padding: got %+v, want {100,1000}", md.xPaddingBytes)
 			}
 		})
 	}
@@ -41,7 +32,7 @@ func TestModeDefaults(t *testing.T) {
 // Verify orModeDefault: an explicit user value overrides the mode default,
 // but a zero/unset range falls back to it.
 func TestOrModeDefault(t *testing.T) {
-	def := Range{From: 256 * 1024, To: 1_000_000}
+	def := Range{From: 1_000_000, To: 1_000_000}
 	// nil → default
 	if got := (*Range)(nil).orModeDefault(def); got != def {
 		t.Errorf("nil: got %+v, want %+v", got, def)
@@ -57,14 +48,12 @@ func TestOrModeDefault(t *testing.T) {
 	}
 }
 
-// Verify the codec picks up per-mode padding/post defaults via newCodec.
+// Verify the codec picks up the default post size via newCodec (Xray-aligned).
 func TestCodecModeDefaults(t *testing.T) {
-	pk := newCodec(Options{Mode: ModePacketUp})
-	if pk.maxEachPostBytes.From != 256*1024 {
-		t.Errorf("packet-up codec post from: got %d, want %d", pk.maxEachPostBytes.From, 256*1024)
-	}
-	su := newCodec(Options{Mode: ModeStreamUp})
-	if su.maxEachPostBytes.From != 1_000_000 {
-		t.Errorf("stream-up codec post from: got %d, want %d", su.maxEachPostBytes.From, 1_000_000)
+	for _, mode := range []string{ModePacketUp, ModeStreamUp} {
+		c := newCodec(Options{Mode: mode})
+		if c.maxEachPostBytes.From != 1_000_000 {
+			t.Errorf("%s codec post from: got %d, want %d", mode, c.maxEachPostBytes.From, 1_000_000)
+		}
 	}
 }
