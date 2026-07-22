@@ -701,13 +701,6 @@ func (c *Client) dialStreamDown(ctx context.Context, sessionID string, xc, xc2 *
 
 // --- packet-up ---
 
-// maxConcurrentPosts limits the number of in-flight packet-up POST
-// goroutines per session. For HTTP/2, the transport multiplexes them
-// onto a single connection; for HTTP/1.1, the transport serializes
-// them via connection pooling. This prevents goroutine explosion when
-// the application writes faster than the network can send.
-const maxConcurrentPosts = 32
-
 func (c *Client) dialPacketUp(ctx context.Context, sessionID string, xc, xc2 *xmuxClient) (net.Conn, error) {
 	downBody, remote, local, err := c.openDownload(ctx, sessionID, xc2)
 	if err != nil {
@@ -747,10 +740,19 @@ func (c *Client) dialPacketUp(ctx context.Context, sessionID string, xc, xc2 *xm
 }
 
 // runPacketUploader drains batched chunks from the accumulator and sends
-// them as concurrent POST requests. Sequence numbers are assigned in the
-// main loop (single-threaded), ensuring correct ordering at the server's
-// uploadQueue. The POSTs themselves run concurrently via goroutines,
-// bounded by a semaphore of size maxConcurrentPosts.
+// them as POST requests, mirroring Xray's splithttp uploader exactly.
+//
+// The loop is single-threaded and sequential: it drains a chunk, assigns the
+// next sequence number, then fires the POST in a goroutine but blocks until
+// that request's *body* has been written to the socket (httptrace.WroteRequest)
+// — NOT until the response arrives. The response (200 OK) is awaited and
+// discarded inside the goroutine. This gives ordered, pipelined uploads whose
+// response round-trips overlap in the background, which is essential over
+// middleboxes like Cloudflare that would otherwise serialize behind response
+// latency or reorder/limit many concurrent POSTs on one H2 connection.
+//
+// Connection rotation happens only when the bound connection exhausts its
+// request/time budget (again matching Xray's dynamicXmuxClient handling).
 func (c *Client) runPacketUploader(
 	ctx context.Context,
 	sessionID string,
@@ -759,25 +761,12 @@ func (c *Client) runPacketUploader(
 	closeAll func() error,
 ) {
 	var (
-		seq    uint64
-		wg     sync.WaitGroup
-		failed atomic.Bool
+		seq       uint64
+		lastWrite time.Time
+		wg        sync.WaitGroup
+		failed    atomic.Bool
 	)
-
-	sem := make(chan struct{}, maxConcurrentPosts)
 	defer wg.Wait()
-
-	// When the pool spans multiple connections, fan this session's POSTs
-	// across them so per-connection pacing intervals overlap in parallel.
-	// The session stays bound to xc for concurrency bookkeeping; the extra
-	// connections are only borrowed to carry POSTs, so we don't touch their
-	// openUsage/leftUsage counters here.
-	spread := c.up.xmux.poolsConnections()
-	var fanout []*xmuxClient
-	var fanIdx int
-	if spread {
-		fanout = c.up.xmux.liveClients()
-	}
 
 	for {
 		if failed.Load() {
@@ -788,71 +777,75 @@ func (c *Client) runPacketUploader(
 		if err != nil || len(chunk) == 0 {
 			return
 		}
-
-		// Re-check after Drain in case a POST failed while we were blocked.
 		if failed.Load() {
 			return
-		}
-
-		// Rotate the bound connection when it hits its lifetime caps. Pick()
-		// sweeps any connection past its request/time budget.
-		if xc.leftRequests.Add(-1) <= 0 ||
-			(!xc.unreusableAt.IsZero() && time.Now().After(xc.unreusableAt)) {
-			newXc := c.up.xmux.Pick()
-			newXc.openUsage.Add(1)
-			xc.openUsage.Add(-1)
-			xc = newXc
-			if spread {
-				fanout = c.up.xmux.liveClients()
-			}
-		}
-
-		// Choose the connection this POST rides on: round-robin over the pool
-		// when spreading, otherwise the session's bound connection.
-		postXc := xc
-		if spread && len(fanout) > 0 {
-			postXc = fanout[fanIdx%len(fanout)]
-			fanIdx++
 		}
 
 		seqStr := strconv.FormatUint(seq, 10)
 		seq++
 
-		// Acquire concurrency slot.
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			return
-		}
-
-		wg.Add(1)
-		go func(seqStr string, payload []byte, postXc *xmuxClient) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-
-			// Per-connection minimum spacing. Reserving a slot returns the
-			// wait this POST owes on its connection; different connections
-			// wait independently, so the pool sends in parallel.
-			if wait := postXc.reservePostSlot(c.minPostInterval); wait > 0 {
+		// Global minimum spacing between POSTs, measured from the last POST's
+		// dispatch. Subtracting the elapsed time means that when chunk
+		// processing already took longer than the interval, we don't wait at
+		// all — this is Xray's "minimum interval" (not a forced interval).
+		if c.minPostInterval.From > 0 {
+			delay := time.Duration(rangeRand(c.minPostInterval))*time.Millisecond - time.Since(lastWrite)
+			if delay > 0 {
 				select {
-				case <-time.After(wait):
+				case <-time.After(delay):
 				case <-ctx.Done():
 					return
 				}
 			}
+		}
+		lastWrite = time.Now()
 
-			if postErr := c.sendOnePost(ctx, sessionID, seqStr, payload, postXc); postErr != nil {
+		// Rotate the bound connection when it hits its lifetime caps.
+		if xc.leftRequests.Add(-1) <= 0 ||
+			(!xc.unreusableAt.IsZero() && lastWrite.After(xc.unreusableAt)) {
+			newXc := c.up.xmux.Pick()
+			newXc.openUsage.Add(1)
+			xc.openUsage.Add(-1)
+			xc = newXc
+		}
+
+		// wroteRequest is closed once the request body is on the socket. The
+		// main loop blocks on it so POSTs are dispatched in seq order without
+		// waiting for responses.
+		wroteRequest := make(chan struct{})
+		var wroteOnce sync.Once
+		signalWrote := func() { wroteOnce.Do(func() { close(wroteRequest) }) }
+
+		wg.Add(1)
+		go func(seqStr string, payload []byte, postXc *xmuxClient) {
+			defer wg.Done()
+			if postErr := c.sendOnePost(ctx, sessionID, seqStr, payload, postXc, signalWrote); postErr != nil {
 				failed.Store(true)
 				_ = acc.CloseWithError(postErr)
 				_ = closeAll()
 			}
-		}(seqStr, chunk, postXc)
+			// Ensure the main loop is never left blocked if the request failed
+			// before WroteRequest fired.
+			signalWrote()
+		}(seqStr, chunk, xc)
+
+		// For the raw HTTP/1.1 path there is no httptrace; sendH1Request is
+		// synchronous per connection anyway, so just wait for the goroutine's
+		// signalWrote (fired at completion). For H2/H3, this unblocks as soon
+		// as the body is flushed to the socket.
+		select {
+		case <-wroteRequest:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
-func (c *Client) sendOnePost(ctx context.Context, sessionID, seqStr string, payload []byte, xc *xmuxClient) error {
+// sendOnePost sends a single uplink POST. onWrote is invoked via
+// httptrace.WroteRequest as soon as the request body has been flushed to the
+// socket (H2/H3), letting the uploader loop dispatch the next POST without
+// waiting for the response. The response is awaited and discarded here.
+func (c *Client) sendOnePost(ctx context.Context, sessionID, seqStr string, payload []byte, xc *xmuxClient, onWrote func()) error {
 	req, err := c.newRequest(ctx, c.method, sessionID, seqStr, nil)
 	if err != nil {
 		return err
@@ -870,10 +863,19 @@ func (c *Client) sendOnePost(ctx context.Context, sessionID, seqStr string, payl
 		req.ContentLength = int64(len(payload))
 	}
 
-	// For HTTP/1.1, use the raw-socket H1Conn pool (matches Xray).
-	// For HTTP/2, use the standard RoundTripper.
+	// For HTTP/1.1, use the raw-socket H1Conn pool (matches Xray). The write
+	// and response read are synchronous, so signal onWrote after it returns.
 	if c.up.h1Pool != nil {
 		return c.up.h1Pool.sendH1Request(ctx, req)
+	}
+
+	// H2/H3: hook WroteRequest so the uploader loop is released the moment the
+	// request body hits the socket, then block here on the response.
+	if onWrote != nil {
+		trace := &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) { onWrote() },
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	}
 
 	resp, err := xc.conn.transport.RoundTrip(req)

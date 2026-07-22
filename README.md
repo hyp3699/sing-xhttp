@@ -245,22 +245,29 @@ below trade obfuscation for speed; pick based on what you need.
   and minimizes per-POST round trips through CDNs.
 - **Obfuscation-first (small chunks):** if you set a small
   `sc_max_each_post_bytes` (e.g. 16 KB) to blend in, the per-POST pacing
-  interval dominates and throughput drops sharply. To recover some of it,
-  configure an `xmux` pool with `max_connections > 1`: the pacing interval
-  is applied **per connection**, so a session's POSTs fan out across the
-  pool and the intervals overlap in parallel. In the benchmark, 16 KB
-  chunks go from ~0.5 MB/s (single connection) to ~1.8 MB/s with
-  `max_connections: 4` — a 3–4x gain, not free 4x, because a single
-  session only spreads over connections the pool has already opened.
-- **`sc_min_posts_interval_ms`** defaults to `{30, 30}` (30 ms). Lowering it
-  raises throughput at the cost of a more bursty, more fingerprintable POST
-  cadence. Setting `{0, 0}` is treated as "unset" and restores the 30 ms
-  default — use a small non-zero value like `{1, 1}` if you genuinely want to
-  disable pacing.
+  interval dominates and throughput drops sharply, because packet-up sends
+  POSTs sequentially (see below).
+- **`sc_min_posts_interval_ms`** defaults to `{30, 30}` (30 ms), matching
+  Xray. It is a *minimum* interval measured from the previous POST's
+  dispatch: if assembling the next chunk already took longer than the
+  interval, no extra wait is added. Lowering it raises throughput on small
+  chunks at the cost of a more bursty, more fingerprintable POST cadence.
+  Setting `{0, 0}` is treated as "unset" and restores the 30 ms default —
+  use a small non-zero value like `{1, 1}` if you genuinely want to disable
+  pacing.
 
-  Note: the per-connection pacing here intentionally differs from stock
-  Xray, which serializes the interval globally. It does not change the wire
-  format (the server never inspects POST timing), so interop is unaffected.
+### Uplink model (packet-up)
+
+The uploader mirrors stock Xray exactly: a single sequential loop drains a
+chunk, assigns the next sequence number, then fires the POST in a goroutine
+but blocks only until that request's **body has been flushed to the socket**
+(`httptrace.WroteRequest`) — not until the response arrives. The 200 OK is
+awaited and discarded in the background. This keeps POSTs in strict sequence
+order (so the server's reassembly queue never has to buffer/reorder) while
+letting response round-trips overlap. An earlier revision used bounded
+concurrent round-trips with per-connection pacing; over Cloudflare that
+reordered sequence numbers and stacked response latency, cutting uplink
+throughput roughly in half — the sequential pipeline restores it.
 
 ## Benchmarks
 
@@ -280,15 +287,17 @@ isolate the post-size variable, rather than relying on the default.
 | stream-up, 1 MB | ~190 MB/s | single long-lived POST, no per-packet overhead |
 | packet-up TLS, 1 MB | ~32 MB/s | fixed 1 MB post chunk |
 | packet-up plaintext, 1 MB | ~32 MB/s | H1 pool, comparable to H2 at 1 MB chunk |
-| packet-up TLS, 1 MB, 16 KB chunks | ~0.5 MB/s | single connection — pacing-bound |
-| packet-up TLS, 1 MB, 16 KB chunks, `max_connections: 4` | ~1.8 MB/s | pacing fans out across the pool |
+| packet-up TLS, 1 MB, 16 KB chunks | ~0.5 MB/s | many small POSTs — pacing-bound |
 
-The 16 KB-chunk rows show the per-POST pacing cost: small
-`sc_max_each_post_bytes` means many POSTs, each gated by
-`sc_min_posts_interval_ms`. On a single connection the intervals serialize;
-an `xmux` pool spreads them across connections to recover 3–4x. For real
-throughput, keep the per-post chunk near 1 MB, or use stream-up where a
-single POST carries the whole uplink.
+The 16 KB-chunk row shows the per-POST pacing cost: small
+`sc_max_each_post_bytes` means many POSTs, each gated by the sequential
+`sc_min_posts_interval_ms`. For real throughput, keep the per-post chunk
+near 1 MB (the default), or use stream-up where a single POST carries the
+whole uplink.
+
+Over a real Cloudflare-fronted server, the sequential pipeline sustains
+~16 MB/s uplink / ~40 MB/s downlink for 10–20 MB transfers (vs ~6 MB/s
+uplink on the earlier concurrent-round-trip revision).
 
 CPU micro-benchmarks (`-bench='GeneratePadding|ApplyMeta|ApplyPadding'`) show
 the request hot path is cheap (~0.4–0.5 µs to place meta), with default-mode
