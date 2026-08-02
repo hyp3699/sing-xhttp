@@ -75,8 +75,28 @@ func NewClientWithDownload(ctx context.Context, dialer N.Dialer, serverAddr M.So
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
-	// Compute H2 keep-alive period from xmux config.
-	var keepAlive time.Duration = 30 * time.Second // Chrome-like default
+	// Compute the H2 PING interval from xmux config.
+	//
+	// Chromium never pings on a timer: its only liveness check is a lazy
+	// "preface PING" emitted just before a HEADERS/DATA write when the
+	// connection has been read-idle for >10s
+	// (SpdySession::MaybeSendPrefacePing). Go's http2.Transport cannot express
+	// that — ReadIdleTimeout is strictly timer-driven — so matching Chrome here
+	// would mean sending no PING at all.
+	//
+	// We deliberately keep a 30s default instead. With no PING, a silently-dead
+	// connection is only noticed when the next POST's RoundTrip fails, so an
+	// upload-idle/download-active session can hang until the OS TCP timeout.
+	// That availability risk outweighs one more fingerprint bit, especially
+	// while the SETTINGS order and pseudo-header order remain unaligned anyway
+	// (see newChromeLikeH2Transport). Set h_keep_alive_period to -1 to disable.
+	var keepAlive time.Duration = 30 * time.Second
+	if options.Xmux != nil && options.Xmux.HKeepAlivePeriod != 0 {
+		keepAlive = time.Duration(options.Xmux.HKeepAlivePeriod) * time.Second
+		if keepAlive < 0 {
+			keepAlive = 0 // explicitly disable
+		}
+	}
 	if options.Xmux != nil && options.Xmux.HKeepAlivePeriod != 0 {
 		keepAlive = time.Duration(options.Xmux.HKeepAlivePeriod) * time.Second
 		if keepAlive < 0 {
@@ -364,25 +384,100 @@ func buildTransportFactory(dialer N.Dialer, tlsConfig aTLS.Config, keepAlivePeri
 		tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
 	}
 	return func() http.RoundTripper {
-		return &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *aTLS.STDConfig) (net.Conn, error) {
-				raw, err := dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
-				if err != nil {
-					return nil, err
-				}
-				tlsConn, err := aTLS.ClientHandshake(ctx, raw, tlsConfig)
-				if err != nil {
-					raw.Close()
-					return nil, err
-				}
-				return tlsConn, nil
-			},
-			ReadIdleTimeout:            keepAlivePeriod,
-			IdleConnTimeout:            300 * time.Second,
-			MaxHeaderListSize:          10 << 20, // 10 MB
-			StrictMaxConcurrentStreams: true,
+		dialTLS := func(ctx context.Context, network, addr string, cfg *aTLS.STDConfig) (net.Conn, error) {
+			raw, err := dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+			if err != nil {
+				return nil, err
+			}
+			tlsConn, err := aTLS.ClientHandshake(ctx, raw, tlsConfig)
+			if err != nil {
+				raw.Close()
+				return nil, err
+			}
+			return tlsConn, nil
 		}
+		return newChromeLikeH2Transport(dialTLS, keepAlivePeriod)
 	}
+}
+
+// h2DialFunc matches http2.Transport.DialTLSContext.
+type h2DialFunc func(ctx context.Context, network, addr string, cfg *aTLS.STDConfig) (net.Conn, error)
+
+// newChromeLikeH2Transport builds an *http2.Transport whose initial SETTINGS
+// frame and initial session WINDOW_UPDATE match Chromium's as closely as the
+// upstream x/net/http2 API allows.
+//
+// Chromium reference (net/spdy/spdy_session.cc SendInitialData, and
+// net/http/http_network_session.{h,cc} AddDefaultHttp2Settings):
+//
+//	SETTINGS  0x1 HEADER_TABLE_SIZE    = 65536      (kSpdyMaxHeaderTableSize)
+//	          0x2 ENABLE_PUSH          = 0          (kSpdyDisablePush)
+//	          0x4 INITIAL_WINDOW_SIZE  = 6291456    (kSpdyStreamMaxRecvWindowSize)
+//	          0x6 MAX_HEADER_LIST_SIZE = 262144     (kSpdyMaxHeaderListSize)
+//	WINDOW_UPDATE stream 0            = 15663105   (15 MiB - 65535)
+//
+// Two gaps remain and cannot be closed without forking x/net/http2:
+//
+//   - Go unconditionally emits 0x5 MAX_FRAME_SIZE, whereas Chrome omits it
+//     because its value equals the protocol default. The *value* does match:
+//     for a Transport (unlike a Server) x/net/http2 clips an unset
+//     MaxReadFrameSize up to minMaxFrameSize, so 0x5 is emitted as 16384 —
+//     exactly the default Chrome relies on. Only the setting's presence differs.
+//   - Go appends the settings in its own order (0x2, 0x4, 0x5, 0x6, then 0x1),
+//     whereas Chrome emits them in ascending id order (0x1, 0x2, 0x4, 0x6).
+//
+// See TestChromeLikeH2InitialFrames, which asserts the frames on the wire.
+func newChromeLikeH2Transport(dialTLS h2DialFunc, keepAlivePeriod time.Duration) *http2.Transport {
+	// MaxDecoderHeaderTableSize, MaxHeaderListSize, ReadIdleTimeout and
+	// IdleConnTimeout live directly on http2.Transport. The two flow-control
+	// window sizes do not — x/net/http2 only reads them from the HTTP2Config of
+	// the net/http Transport it is attached to (see configFromTransport, which
+	// calls fillNetHTTPConfig(&conf, h2.t1.HTTP2)). ConfigureTransports is the
+	// only exported way to establish that link, so build a throwaway
+	// *http.Transport purely to carry the config; we never issue requests
+	// through it.
+	t1 := &http.Transport{
+		HTTP2: &http.HTTP2Config{
+			// -> SETTINGS 0x4 INITIAL_WINDOW_SIZE
+			MaxReceiveBufferPerStream: 6 * 1024 * 1024,
+			// -> initial WINDOW_UPDATE on stream 0. Go writes this value
+			// verbatim and seeds the connection inflow with value+65535,
+			// landing on the same 15 MiB session window Chrome uses.
+			MaxReceiveBufferPerConnection: 15*1024*1024 - 65535,
+		},
+	}
+	transport, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		// Only fails if t1 was already HTTP/2-enabled, which cannot happen for
+		// a Transport we just allocated. Fall back to an unlinked transport so
+		// a future upstream change degrades the fingerprint instead of
+		// breaking the dial.
+		transport = &http2.Transport{}
+	}
+	transport.DialTLSContext = dialTLS
+	// ConfigureTransports installs a noDialClientConnPool, because in its
+	// intended use net/http owns dialing and the HTTP/2 transport only adopts
+	// already-established connections. We dial ourselves, so clear it and let
+	// initConnPool build the normal dialing pool. Everything else t1 carries is
+	// zero-valued, so the t1-derived knobs (DisableKeepAlives,
+	// ResponseHeaderTimeout, IdleConnTimeout, ...) all stay at their defaults.
+	transport.ConnPool = nil
+	// Go emits 0x1 only when this differs from the protocol default of 4096,
+	// so setting it is what makes the setting appear at all.
+	transport.MaxDecoderHeaderTableSize = 65536
+	// -> SETTINGS 0x6 MAX_HEADER_LIST_SIZE. Note that 0 would not mean
+	// "unlimited" here: x/net/http2 substitutes its own 10 MiB default.
+	transport.MaxHeaderListSize = 256 * 1024
+	// Periodic PING interval. Chrome pings lazily rather than on a timer, but we
+	// keep a 30s default for dead-connection detection; see the keepAlive
+	// comment in NewClientWithDownload.
+	transport.ReadIdleTimeout = keepAlivePeriod
+	// Chrome keeps idle H2 sessions indefinitely for reuse — SpdySession has no
+	// idle timer at all; idle sessions are only closed under socket-pool
+	// pressure or on network/power events.
+	transport.IdleConnTimeout = 0
+	transport.StrictMaxConcurrentStreams = true
+	return transport
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {

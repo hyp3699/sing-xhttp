@@ -192,6 +192,45 @@ The XMUX field names mirror Xray's so the same config block works on both
 sides. Setting `max_connections > 0` with `max_concurrency=0` simply spreads
 sessions over up to N conns without per-conn caps.
 
+### Chromium-aligned HTTP/2 settings
+
+The H2 client sends the same initial SETTINGS values and initial session
+WINDOW_UPDATE that Chromium does, so the connection opening does not stand out
+from a browser's. Sources are Chromium `net/spdy/spdy_session.cc`
+(`SendInitialData`) and `net/http/http_network_session.cc`
+(`AddDefaultHttp2Settings`).
+
+| Setting | Value | Chromium constant |
+|---|---|---|
+| `0x1` HEADER_TABLE_SIZE | 65536 | `kSpdyMaxHeaderTableSize` |
+| `0x2` ENABLE_PUSH | 0 | `kSpdyDisablePush` |
+| `0x4` INITIAL_WINDOW_SIZE | 6291456 | `kSpdyStreamMaxRecvWindowSize` |
+| `0x6` MAX_HEADER_LIST_SIZE | 262144 | `kSpdyMaxHeaderListSize` |
+| WINDOW_UPDATE (stream 0) | 15663105 | `kSpdySessionMaxRecvWindowSize - kDefaultInitialWindowSize` |
+
+Idle connections are never closed on a timer, matching Chromium: `SpdySession`
+has no idle timeout and keeps idle sessions indefinitely for reuse.
+
+Three differences remain, all of which would require forking
+`golang.org/x/net/http2`:
+
+- `0x5` MAX_FRAME_SIZE is emitted (as 16384, the value Chrome relies on);
+  Chrome omits the setting entirely because it equals the protocol default.
+- Settings go out in Go's order (`0x2, 0x4, 0x5, 0x6, 0x1`) rather than
+  Chrome's ascending id order (`0x1, 0x2, 0x4, 0x6`).
+- HEADERS carry no priority fields and no RFC 9218 `priority` header, and the
+  pseudo-header order is Go's `:authority, :method, :path, :scheme` rather than
+  Chrome's `:method, :authority, :scheme, :path`.
+
+One deliberate departure: Chrome sends no periodic PING (its only liveness
+check is a lazy PING emitted just before a write on a connection that has been
+read-idle for >10s, which `http2.Transport` cannot express). We keep a 30s
+`ReadIdleTimeout` instead, because without it a silently-dead connection is
+only noticed when the next POST fails — an upload-idle/download-active session
+would hang until the OS TCP timeout. Set `h_keep_alive_period: -1` to disable.
+
+`TestChromeLikeH2InitialFrames` asserts the frames on the wire.
+
 ## Defaults
 
 When a tuning field is left unset, these Xray-aligned defaults apply (see
