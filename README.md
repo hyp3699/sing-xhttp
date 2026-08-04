@@ -211,16 +211,14 @@ from a browser's. Sources are Chromium `net/spdy/spdy_session.cc`
 Idle connections are never closed on a timer, matching Chromium: `SpdySession`
 has no idle timeout and keeps idle sessions indefinitely for reuse.
 
-Three differences remain, all of which would require forking
-`golang.org/x/net/http2`:
-
-- `0x5` MAX_FRAME_SIZE is emitted (as 16384, the value Chrome relies on);
-  Chrome omits the setting entirely because it equals the protocol default.
-- Settings go out in Go's order (`0x2, 0x4, 0x5, 0x6, 0x1`) rather than
-  Chrome's ascending id order (`0x1, 0x2, 0x4, 0x6`).
-- HEADERS carry no priority fields and no RFC 9218 `priority` header, and the
-  pseudo-header order is Go's `:authority, :method, :path, :scheme` rather than
-  Chrome's `:method, :authority, :scheme, :path`.
+The client adapts the upstream transport's outbound frame stream without
+forking `golang.org/x/net/http2`: the default `0x5` MAX_FRAME_SIZE setting is
+removed, the remaining initial settings are emitted in Chromium's order,
+request HEADERS carry the Chromium-style priority tuple, and the RFC 9218
+`priority: i` header is added for HTTP/2 requests. HPACK header blocks are
+decoded and re-encoded in the same client-to-server context so the request
+pseudo-headers are ordered as `:method, :authority, :scheme, :path` while
+preserving dynamic-table state.
 
 One deliberate departure: Chrome sends no periodic PING (its only liveness
 check is a lazy PING emitted just before a write on a connection that has been

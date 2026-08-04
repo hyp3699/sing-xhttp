@@ -608,6 +608,10 @@ func (s *Server) handleDownloadGet(w http.ResponseWriter, r *http.Request, sessi
 	case <-ctx.Done():
 	case <-done:
 	}
+	// A ResponseWriter is only valid until this handler returns. Closing the
+	// split connection also closes flushWriter under its mutex, waiting for any
+	// in-flight Write/Flush and rejecting writes from an async upper layer.
+	_ = conn.Close()
 	close(finished)
 	if sess != nil {
 		_ = sess.Close()

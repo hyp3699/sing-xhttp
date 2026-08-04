@@ -1,15 +1,19 @@
 package xhttp
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	aTLS "github.com/sagernet/sing/common/tls"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // TestChromeLikeH2InitialFrames asserts the exact bytes newChromeLikeH2Transport
@@ -89,48 +93,19 @@ func TestChromeLikeH2InitialFrames(t *testing.T) {
 		t.Logf("SETTINGS 0x%x = %d", uint16(s.ID), s.Val)
 	}
 
-	// Values we control must match Chromium exactly.
-	want := map[http2.SettingID]uint32{
-		http2.SettingHeaderTableSize:   65536,           // kSpdyMaxHeaderTableSize
-		http2.SettingEnablePush:        0,               // kSpdyDisablePush
-		http2.SettingInitialWindowSize: 6 * 1024 * 1024, // kSpdyStreamMaxRecvWindowSize
-		http2.SettingMaxHeaderListSize: 256 * 1024,      // kSpdyMaxHeaderListSize
+	want := []kv{
+		{http2.SettingHeaderTableSize, 65536},
+		{http2.SettingEnablePush, 0},
+		{http2.SettingInitialWindowSize, 6 * 1024 * 1024},
+		{http2.SettingMaxHeaderListSize, 256 * 1024},
 	}
-	seen := make(map[http2.SettingID]uint32, len(got))
-	for _, s := range got {
-		seen[s.ID] = s.Val
+	if len(got) != len(want) {
+		t.Fatalf("SETTINGS = %v, want %v", got, want)
 	}
-	for id, wantVal := range want {
-		gotVal, present := seen[id]
-		if !present {
-			t.Errorf("SETTINGS 0x%x missing, want %d", uint16(id), wantVal)
-			continue
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("SETTINGS[%d] = %+v, want %+v", i, got[i], want[i])
 		}
-		if gotVal != wantVal {
-			t.Errorf("SETTINGS 0x%x = %d, want %d", uint16(id), gotVal, wantVal)
-		}
-	}
-
-	// Documented residual gap: Chrome omits 0x5 entirely because its value
-	// equals the protocol default. x/net/http2 always emits it, but clips an
-	// unset Transport.MaxReadFrameSize up to minMaxFrameSize, so the value we
-	// send is the same 16384 Chrome relies on — only the presence differs.
-	if val, present := seen[http2.SettingMaxFrameSize]; !present {
-		t.Log("note: 0x5 MAX_FRAME_SIZE no longer emitted; Chrome parity improved, update docs")
-	} else if val != 16384 {
-		t.Errorf("SETTINGS 0x5 = %d, want 16384 (the default Chrome relies on)", val)
-	}
-
-	// Documented residual gap: Chrome emits settings in ascending id order.
-	ascending := true
-	for i := 1; i < len(got); i++ {
-		if got[i].ID < got[i-1].ID {
-			ascending = false
-			break
-		}
-	}
-	if ascending {
-		t.Log("note: settings now in ascending id order; Chrome parity improved, update docs")
 	}
 
 	// 3. Initial session WINDOW_UPDATE on stream 0.
@@ -150,6 +125,64 @@ func TestChromeLikeH2InitialFrames(t *testing.T) {
 		t.Errorf("WINDOW_UPDATE increment = %d, want %d", windowUpdate.Increment, wantIncrement)
 	}
 	t.Logf("WINDOW_UPDATE stream=%d increment=%d", windowUpdate.StreamID, windowUpdate.Increment)
+
+	// 4. Request HEADERS use Chromium's RFC 7540 priority tuple.
+	frame, err = framer.ReadFrame()
+	if err != nil {
+		t.Fatalf("read HEADERS: %v", err)
+	}
+	headers, ok := frame.(*http2.HeadersFrame)
+	if !ok {
+		t.Fatalf("third frame is %T, want *http2.HeadersFrame", frame)
+	}
+	if !headers.HasPriority() {
+		t.Fatal("HEADERS has no priority")
+	}
+	if got, want := headers.Priority.StreamDep, uint32(0); got != want {
+		t.Errorf("HEADERS dependency = %d, want %d", got, want)
+	}
+	if !headers.Priority.Exclusive {
+		t.Error("HEADERS dependency is not exclusive")
+	}
+	if got, want := headers.Priority.Weight, uint8(146); got != want {
+		t.Errorf("HEADERS wire weight = %d, want %d", got, want)
+	}
+
+	var block bytes.Buffer
+	block.Write(headers.HeaderBlockFragment())
+	for !headers.HeadersEnded() {
+		frame, err = framer.ReadFrame()
+		if err != nil {
+			t.Fatalf("read CONTINUATION: %v", err)
+		}
+		continuation, ok := frame.(*http2.ContinuationFrame)
+		if !ok {
+			t.Fatalf("header continuation is %T", frame)
+		}
+		block.Write(continuation.HeaderBlockFragment())
+		if continuation.HeadersEnded() {
+			break
+		}
+	}
+	fields, err := hpack.NewDecoder(4096, nil).DecodeFull(block.Bytes())
+	if err != nil {
+		t.Fatalf("decode request headers: %v", err)
+	}
+	var pseudo []string
+	for _, field := range fields {
+		if field.IsPseudo() {
+			pseudo = append(pseudo, field.Name)
+		}
+	}
+	wantPseudo := []string{":method", ":authority", ":scheme", ":path"}
+	if len(pseudo) != len(wantPseudo) {
+		t.Fatalf("pseudo headers = %v, want %v", pseudo, wantPseudo)
+	}
+	for i := range wantPseudo {
+		if pseudo[i] != wantPseudo[i] {
+			t.Fatalf("pseudo headers = %v, want %v", pseudo, wantPseudo)
+		}
+	}
 }
 
 // TestChromeLikeH2PingAndIdle pins the PING / idle-connection knobs.
@@ -173,6 +206,70 @@ func TestChromeLikeH2PingAndIdle(t *testing.T) {
 		if got := transport.IdleConnTimeout; got != 0 {
 			t.Errorf("IdleConnTimeout = %v, want 0", got)
 		}
+	}
+}
+
+func TestChromeH2RequestPriorityHeader(t *testing.T) {
+	baseURL := url.URL{Scheme: "https", Host: "example.com", Path: "/xhttp"}
+	newTestClient := func(headers http.Header) *Client {
+		options := Options{Path: "/xhttp"}
+		return &Client{
+			headers: headers,
+			codec:   newCodec(options),
+		}
+	}
+
+	t.Run("default", func(t *testing.T) {
+		client := newTestClient(nil)
+		req, err := client.newRequestWithTransport(context.Background(), http.MethodGet, &transportSet{
+			httpVersion: "2",
+			requestURL:  baseURL,
+			host:        "example.com",
+		}, "session", "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := req.Header.Get("Priority"); got != "i" {
+			t.Fatalf("Priority = %q, want %q", got, "i")
+		}
+	})
+
+	t.Run("user value", func(t *testing.T) {
+		client := newTestClient(http.Header{"priority": {"u=1"}})
+		req, err := client.newRequestWithTransport(context.Background(), http.MethodGet, &transportSet{
+			httpVersion: "2",
+			requestURL:  baseURL,
+			host:        "example.com",
+		}, "session", "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var priorityValues []string
+		for name, values := range req.Header {
+			if strings.EqualFold(name, "priority") {
+				priorityValues = append(priorityValues, values...)
+			}
+		}
+		if len(priorityValues) != 1 || priorityValues[0] != "u=1" {
+			t.Fatalf("priority values = %v, want [u=1]", priorityValues)
+		}
+	})
+
+	for _, version := range []string{"1.1", "3"} {
+		t.Run("HTTP "+version, func(t *testing.T) {
+			client := newTestClient(nil)
+			req, err := client.newRequestWithTransport(context.Background(), http.MethodGet, &transportSet{
+				httpVersion: version,
+				requestURL:  baseURL,
+				host:        "example.com",
+			}, "session", "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := req.Header.Get("Priority"); got != "" {
+				t.Fatalf("Priority = %q, want empty", got)
+			}
+		})
 	}
 }
 

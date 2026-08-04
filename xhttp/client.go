@@ -97,12 +97,6 @@ func NewClientWithDownload(ctx context.Context, dialer N.Dialer, serverAddr M.So
 			keepAlive = 0 // explicitly disable
 		}
 	}
-	if options.Xmux != nil && options.Xmux.HKeepAlivePeriod != 0 {
-		keepAlive = time.Duration(options.Xmux.HKeepAlivePeriod) * time.Second
-		if keepAlive < 0 {
-			keepAlive = 0 // explicitly disable
-		}
-	}
 
 	// Detect REALITY: REALITY configs return an error from Config().
 	isReality := false
@@ -454,7 +448,13 @@ func newChromeLikeH2Transport(dialTLS h2DialFunc, keepAlivePeriod time.Duration)
 		// breaking the dial.
 		transport = &http2.Transport{}
 	}
-	transport.DialTLSContext = dialTLS
+	transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *aTLS.STDConfig) (net.Conn, error) {
+		conn, err := dialTLS(ctx, network, addr, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return newChromeH2Conn(conn), nil
+	}
 	// ConfigureTransports installs a noDialClientConnPool, because in its
 	// intended use net/http owns dialing and the HTTP/2 transport only adopts
 	// already-established connections. We dial ourselves, so clear it and let
@@ -554,9 +554,21 @@ func (c *Client) newRequestWithTransport(ctx context.Context, method string, ts 
 	}
 	req.Host = ts.host
 	req.Header = c.cloneHeaders()
+	if ts.httpVersion == "2" && !headerExists(req.Header, "Priority") {
+		req.Header.Set("Priority", "i")
+	}
 	c.codec.applyMetaToRequest(req, sessionID, seqStr)
 	c.codec.applyPaddingToRequest(req)
 	return req, nil
+}
+
+func headerExists(header http.Header, name string) bool {
+	for key := range header {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // openDownload opens the long-lived GET that carries the downlink using the
@@ -992,6 +1004,7 @@ func (c *Client) sendOnePost(ctx context.Context, sessionID, seqStr string, payl
 type waitReadCloser struct {
 	ready  chan struct{}
 	once   sync.Once
+	mu     sync.Mutex
 	body   io.ReadCloser
 	err    error
 	closed atomic.Bool
@@ -1002,42 +1015,53 @@ func newWaitReadCloser() *waitReadCloser {
 }
 
 func (w *waitReadCloser) set(body io.ReadCloser) {
+	w.mu.Lock()
+	w.body = body
+	closed := w.closed.Load()
+	w.mu.Unlock()
 	w.once.Do(func() {
-		w.body = body
 		close(w.ready)
 	})
 	// If Close raced ahead of set, close the just-arrived body now.
-	if w.closed.Load() && w.body != nil {
-		_ = w.body.Close()
+	if closed {
+		_ = body.Close()
 	}
 }
 
 func (w *waitReadCloser) closeWithError(err error) {
+	w.mu.Lock()
+	w.err = err
+	w.mu.Unlock()
 	w.once.Do(func() {
-		w.err = err
 		close(w.ready)
 	})
 }
 
 func (w *waitReadCloser) Read(p []byte) (int, error) {
-	if w.body == nil {
-		<-w.ready
-		if w.err != nil {
-			return 0, w.err
-		}
-		if w.body == nil {
-			return 0, io.EOF
-		}
+	// The channel receive publishes body/err written before ready is closed.
+	// Checking body before receiving would race with set.
+	<-w.ready
+	w.mu.Lock()
+	body, err := w.body, w.err
+	w.mu.Unlock()
+	if err != nil {
+		return 0, err
 	}
-	return w.body.Read(p)
+	if body == nil {
+		return 0, io.EOF
+	}
+	return body.Read(p)
 }
 
 func (w *waitReadCloser) Close() error {
 	w.closed.Store(true)
 	// Unblock any pending Read.
 	w.once.Do(func() { close(w.ready) })
-	if w.body != nil {
-		return w.body.Close()
+	w.mu.Lock()
+	body := w.body
+	w.mu.Unlock()
+	if body != nil {
+		return body.Close()
 	}
 	return nil
 }
