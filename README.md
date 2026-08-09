@@ -6,12 +6,20 @@ Scope of this port (intentional subset of the upstream):
 
 | Mode | Status | HTTP version |
 |---|---|---|
-| `packet-up` | implemented | H1.1 (plaintext, raw-socket pool) and H2 (TLS) |
-| `stream-up` | implemented | H2 (TLS) only |
-| `stream-one` | implemented | H2 (TLS) only (REALITY-style single bidirectional stream) |
+| `packet-up` | implemented | H1.1 (plaintext, raw-socket pool), H2, and H3 |
+| `stream-up` | implemented | H2 and H3 (TLS) |
+| `stream-one` | implemented | H2 and H3 (TLS) (REALITY-style single bidirectional stream) |
 | `stream-down` | implemented | H1.1 / H2 / H3 (separate download path/host) |
-| `auto` | implemented | defaults to packet-up, or stream-one if REALITY |
-| HTTP/3 | implemented | QUIC transport (client + server) |
+| `auto` | implemented | defaults to packet-up, or stream-one if REALITY; H2/H3 with TLS |
+| HTTP/3 | implemented | QUIC transport (client + server), standard TLS only |
+
+HTTP/3 is selected by putting `h3` first in the TLS ALPN list, and requires a
+TLS implementation that can expose a standard `*tls.Config`. quic-go performs
+the TLS 1.3 handshake itself through `crypto/tls` and exposes no hook for a
+caller-supplied ClientHello, so uTLS cannot shape a QUIC handshake — and
+REALITY, which is built on uTLS, only speaks HTTP/1.1 or HTTP/2. Asking for
+`h3` together with either is rejected at client construction rather than
+silently falling back to HTTP/2 over TCP.
 
 Why stream-up isn't supported on plaintext H1.1: Go's `net/http` client
 buffers chunked request bodies internally, breaking the "never-FIN POST"

@@ -106,6 +106,10 @@ func NewClientWithDownload(ctx context.Context, dialer N.Dialer, serverAddr M.So
 		}
 	}
 
+	if err := validateHTTP3TLS(tlsConfig); err != nil {
+		return nil, err
+	}
+
 	// Decide HTTP version.
 	httpVersion := decideHTTPVersion(tlsConfig, isReality)
 
@@ -165,6 +169,9 @@ func NewClientWithDownload(ctx context.Context, dialer N.Dialer, serverAddr M.So
 			if _, err := downloadTLS.STDConfig(); err != nil {
 				dlReality = true
 			}
+		}
+		if err := validateHTTP3TLS(downloadTLS); err != nil {
+			return nil, E.Cause(err, "download transport")
 		}
 		dlHTTPVersion := decideHTTPVersion(downloadTLS, dlReality)
 
@@ -314,6 +321,29 @@ func decideHTTPVersion(tlsConfig aTLS.Config, isReality bool) string {
 	default:
 		return "2"
 	}
+}
+
+// validateHTTP3TLS rejects an explicit h3 ALPN when the TLS implementation
+// cannot expose a standard *tls.Config.
+//
+// quic-go drives the TLS 1.3 handshake itself through crypto/tls and exposes no
+// hook to substitute a custom ClientHello, so uTLS — and REALITY, which is
+// built on uTLS — cannot be used over QUIC. Both return an error from
+// STDConfig(), and without this check decideHTTPVersion would silently fall
+// back to HTTP/2 over TCP while the peer listens for QUIC, or hand quic-go a
+// standard ClientHello that carries none of the requested fingerprint.
+func validateHTTP3TLS(tlsConfig aTLS.Config) error {
+	if tlsConfig == nil {
+		return nil
+	}
+	nextProtos := tlsConfig.NextProtos()
+	if len(nextProtos) == 0 || nextProtos[0] != "h3" {
+		return nil
+	}
+	if _, err := tlsConfig.STDConfig(); err != nil {
+		return E.New("xhttp: HTTP/3 requires a standard TLS client: uTLS and REALITY are not supported over QUIC, they only support HTTP/1.1 and HTTP/2")
+	}
+	return nil
 }
 
 func (c *Client) Close() error {
