@@ -5,6 +5,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/sagernet/sing/common/baderror"
 )
 
 // splitConn is the net.Conn handed to upper layers. Reads come from the GET
@@ -19,8 +21,15 @@ type splitConn struct {
 	onClose func() error
 }
 
-func (c *splitConn) Read(b []byte) (int, error)  { return c.reader.Read(b) }
-func (c *splitConn) Write(b []byte) (int, error) { return c.writer.Write(b) }
+func (c *splitConn) Read(b []byte) (int, error) {
+	n, err := c.reader.Read(b)
+	return n, baderror.WrapH2(err)
+}
+
+func (c *splitConn) Write(b []byte) (int, error) {
+	n, err := c.writer.Write(b)
+	return n, baderror.WrapH2(err)
+}
 
 func (c *splitConn) Close() error {
 	var err error

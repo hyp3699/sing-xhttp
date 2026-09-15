@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/justinwoo280/sing-xhttp/xhttp"
 )
@@ -130,6 +131,76 @@ func TestUplinkDataAuto(t *testing.T) {
 func TestEchoStreamOneTLS(t *testing.T) { runEcho(t, xhttp.ModeStreamOne, true) }
 
 func TestEchoStreamDownTLS(t *testing.T) { runEcho(t, xhttp.ModeStreamDown, true) }
+
+type streamOneLateWriter struct {
+	ready  chan struct{}
+	result chan error
+}
+
+func (h *streamOneLateWriter) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socksaddr, _ M.Socksaddr, _ N.CloseHandlerFunc) {
+	close(h.ready)
+	go func() {
+		<-ctx.Done()
+		// Give the HTTP/2 server handler time to leave ServeHTTP. The
+		// transport must close the response writer before that happens, so
+		// this write cannot create DATA after the response END_STREAM.
+		time.Sleep(20 * time.Millisecond)
+		_, err := conn.Write([]byte("late"))
+		h.result <- err
+	}()
+}
+
+func TestStreamOneClosesWriterBeforeHandlerReturn(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+
+	sTLS, cTLS := makeTLSPair(t)
+	opts := xhttp.Options{Mode: xhttp.ModeStreamOne, Path: "/xhttp"}
+	ctx := context.Background()
+	handler := &streamOneLateWriter{ready: make(chan struct{}), result: make(chan error, 1)}
+	server, err := xhttp.NewServer(ctx, logger.NOP(), opts, anyServerTLS(sTLS), handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go server.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", port), opts, anyClientTLS(cTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conn, err := client.DialContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("start")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handler.ready:
+	case <-time.After(time.Second):
+		t.Fatal("stream-one handler was not called")
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-handler.result:
+		if err == nil {
+			t.Fatal("late stream-one write succeeded after handler return")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("late stream-one write did not complete")
+	}
+}
 
 // stream-down with a distinct download path (shared dialer/TLS) must still echo.
 func TestStreamDownSeparatePath(t *testing.T) {

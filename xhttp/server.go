@@ -527,7 +527,10 @@ func (s *Server) handleStreamOne(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = r.Body.Close()
+			// Close both halves before the HTTP/2 handler returns. Closing only
+			// the request body leaves an upper-layer writer able to race with
+			// net/http's implicit END_STREAM on the response.
+			_ = conn.Close()
 		case <-finished:
 		}
 	}()
@@ -539,6 +542,9 @@ func (s *Server) handleStreamOne(w http.ResponseWriter, r *http.Request) {
 	case <-ctx.Done():
 	case <-finished:
 	}
+	// The context watcher normally closes this first, but keep the close here
+	// as well for the case where the handler exits through the finished path.
+	_ = conn.Close()
 	close(finished)
 }
 

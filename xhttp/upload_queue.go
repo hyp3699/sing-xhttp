@@ -21,6 +21,7 @@ type packet struct {
 type uploadQueue struct {
 	mu          sync.Mutex
 	pushed      chan packet
+	done        chan struct{}
 	heap        uploadHeap
 	nextSeq     uint64
 	closed      bool
@@ -33,6 +34,7 @@ func newUploadQueue(maxBuffered int) *uploadQueue {
 	}
 	return &uploadQueue{
 		pushed:      make(chan packet, maxBuffered),
+		done:        make(chan struct{}),
 		maxBuffered: maxBuffered,
 	}
 }
@@ -47,8 +49,15 @@ func (q *uploadQueue) Push(p packet) error {
 	// Blocking send provides natural back-pressure: when the queue is full,
 	// the server's ServeHTTP POST handler waits, which in turn flow-controls
 	// the H2 stream, which back-pressures the client's Write().
-	q.pushed <- p
-	return nil
+	//
+	// done is separate from pushed: Close must wake blocked producers without
+	// closing a channel that a producer may already be sending to.
+	select {
+	case q.pushed <- p:
+		return nil
+	case <-q.done:
+		return E.New("upload queue closed")
+	}
 }
 
 func (q *uploadQueue) Close() error {
@@ -58,15 +67,17 @@ func (q *uploadQueue) Close() error {
 		return nil
 	}
 	q.closed = true
-	close(q.pushed)
+	close(q.done)
 	return nil
 }
 
 // Read implements io.Reader. It returns reassembled bytes in seq order.
 func (q *uploadQueue) Read(b []byte) (int, error) {
 	if len(q.heap) == 0 {
-		p, ok := <-q.pushed
-		if !ok {
+		var p packet
+		select {
+		case p = <-q.pushed:
+		case <-q.done:
 			return 0, io.EOF
 		}
 		heap.Push(&q.heap, p)
@@ -88,8 +99,10 @@ func (q *uploadQueue) Read(b []byte) (int, error) {
 				return 0, E.New("reassembly buffer overflow")
 			}
 			heap.Push(&q.heap, p)
-			next, ok := <-q.pushed
-			if !ok {
+			var next packet
+			select {
+			case next = <-q.pushed:
+			case <-q.done:
 				return 0, io.EOF
 			}
 			heap.Push(&q.heap, next)
