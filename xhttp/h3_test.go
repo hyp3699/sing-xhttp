@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -22,6 +23,10 @@ func (c *unsupportedH3TLS) SetServerName(string) {}
 func (c *unsupportedH3TLS) NextProtos() []string { return c.nextProtos }
 
 func (c *unsupportedH3TLS) SetNextProtos(nextProtos []string) { c.nextProtos = nextProtos }
+
+func (c *unsupportedH3TLS) HandshakeTimeout() time.Duration { return 0 }
+
+func (c *unsupportedH3TLS) SetHandshakeTimeout(time.Duration) {}
 
 func (c *unsupportedH3TLS) STDConfig() (*aTLS.STDConfig, error) {
 	return nil, errors.New("unsupported custom TLS")
