@@ -70,6 +70,19 @@ func TestChromeH2ConnCoalescedFrames(t *testing.T) {
 	}
 }
 
+func TestChromeH2ConnBatchesFramesPerWrite(t *testing.T) {
+	underlying := &recordingConn{}
+	conn := newChromeH2Conn(underlying)
+	writeChromeH2Preamble(t, conn)
+
+	if got := underlying.writeCalls; got != 1 {
+		t.Fatalf("underlying Write calls = %d, want 1", got)
+	}
+	if got := underlying.writeSizes[0]; got != len(underlying.Bytes()) {
+		t.Fatalf("batched write size = %d, recorded bytes = %d", got, len(underlying.Bytes()))
+	}
+}
+
 func TestChromeH2ConnPriorityDependencies(t *testing.T) {
 	underlying := &recordingConn{}
 	conn := newChromeH2Conn(underlying).(*chromeH2Conn)
@@ -469,9 +482,13 @@ type recordingConn struct {
 	bytes.Buffer
 	writeLimit int
 	writeErr   error
+	writeCalls int
+	writeSizes []int
 }
 
 func (c *recordingConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+	c.writeSizes = append(c.writeSizes, len(p))
 	if c.writeLimit > 0 && len(p) > c.writeLimit {
 		p = p[:c.writeLimit]
 	}
