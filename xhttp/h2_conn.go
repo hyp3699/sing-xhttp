@@ -99,6 +99,10 @@ func (c *chromeH2Conn) Write(p []byte) (int, error) {
 		return 0, c.writeErr
 	}
 	c.writeBuf = append(c.writeBuf, p...)
+	// Keep the transformed frames from one transport flush together. Writing
+	// each frame directly to the TLS connection would expose our adapter's
+	// frame boundaries as extra application records to passive observers.
+	var output []byte
 	for {
 		if !c.prefaceWritten {
 			if len(c.writeBuf) < len(http2.ClientPreface) {
@@ -110,12 +114,12 @@ func (c *chromeH2Conn) Write(p []byte) (int, error) {
 			if !bytes.Equal(c.writeBuf[:len(http2.ClientPreface)], []byte(http2.ClientPreface)) {
 				return 0, c.setWriteError(errInvalidH2Write)
 			}
-			if err := writeAll(c.Conn, c.writeBuf[:len(http2.ClientPreface)]); err != nil {
-				return 0, c.setWriteError(err)
-			}
+			output = append(output, c.writeBuf[:len(http2.ClientPreface)]...)
 			c.writeBuf = c.writeBuf[len(http2.ClientPreface):]
 			c.prefaceWritten = true
-			continue
+		}
+		if len(c.writeBuf) == 0 {
+			break
 		}
 
 		frameLen, complete, err := bufferedH2FrameLen(c.writeBuf)
@@ -123,18 +127,22 @@ func (c *chromeH2Conn) Write(p []byte) (int, error) {
 			return 0, c.setWriteError(err)
 		}
 		if !complete {
-			return len(p), nil
+			break
 		}
 		frame := c.writeBuf[:frameLen]
-		output, err := c.transformWriteFrame(frame)
+		transformed, err := c.transformWriteFrame(frame)
 		if err != nil {
 			return 0, c.setWriteError(err)
 		}
+		output = append(output, transformed...)
+		c.writeBuf = c.writeBuf[frameLen:]
+	}
+	if len(output) > 0 {
 		if err := writeAll(c.Conn, output); err != nil {
 			return 0, c.setWriteError(err)
 		}
-		c.writeBuf = c.writeBuf[frameLen:]
 	}
+	return len(p), nil
 }
 
 func (c *chromeH2Conn) setWriteError(err error) error {
